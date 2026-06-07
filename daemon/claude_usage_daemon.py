@@ -39,6 +39,10 @@ STATE_FILE = Path.home() / ".clawdmeter" / "state.json"  # written by clawdmeter
 WORKING_STALE_SECONDS = 120  # ignore a session's phase=="running" older than this (missed-Stop guard)
 MAX_SESSIONS = 5             # cap the Activity-screen list sent over BLE
 MAX_BLE_PAYLOAD = 480        # keep under NimBLE's 512-byte attribute cap
+# Auto-recovery: if no successful BLE write lands for this long, exit non-zero so
+# launchd relaunches us with a fresh CoreBluetooth stack — the proven fix after
+# the Mac sleeps and the link wedges. (plist KeepAlive restarts us ~10s later.)
+STALE_RESTART_SECONDS = 300
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -230,6 +234,14 @@ async def scan_for_device() -> str | None:
 # physical link, so this rides the existing HID connection — the keyboard
 # keeps working.
 _cb_manager = None  # reused CentralManagerDelegate (CoreBluetooth)
+_last_success_ts = 0.0  # time.time() of the last successful BLE write (for the watchdog)
+
+
+def reset_cb_manager() -> None:
+    """Drop the cached CoreBluetooth central so the next lookup builds a fresh
+    one — clears a manager that went stale across a Mac sleep/wake."""
+    global _cb_manager
+    _cb_manager = None
 
 
 async def _get_cb_manager():
@@ -407,6 +419,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     used successfully (so the caller keeps the cached address), False if the
     connection failed and the cache should be invalidated.
     """
+    global _last_success_ts
     display = target if isinstance(target, str) else target.address
     log(f"Connecting to {display}...")
     client = BleakClient(target)
@@ -468,6 +481,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 if push:
                     if await session.write_payload(last_payload):
                         used_successfully = True
+                        _last_success_ts = time.time()
                         if do_poll:
                             last_poll = time.time()
 
@@ -485,7 +499,30 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     return used_successfully
 
 
+async def watchdog(stop_event: asyncio.Event) -> None:
+    """Self-heal: if the BLE link wedges (no successful write for a while — e.g.
+    after the Mac sleeps and CoreBluetooth gets stuck), exit non-zero so launchd
+    relaunches us with a fresh stack. Automates the manual `launchctl kickstart`."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+        stale = time.time() - _last_success_ts
+        if stale > STALE_RESTART_SECONDS:
+            log(f"Watchdog: no successful update in {int(stale)}s — re-exec for a clean reconnect")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # Replace this process with a fresh one (new CoreBluetooth stack).
+            # Doesn't depend on launchd KeepAlive, so it works regardless.
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 async def main() -> None:
+    global _last_success_ts
+    _last_success_ts = time.time()  # grace period before the watchdog can fire
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -502,6 +539,8 @@ async def main() -> None:
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
+    loop.create_task(watchdog(stop_event))
+
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
     while not stop_event.is_set():
@@ -511,6 +550,8 @@ async def main() -> None:
         skip_addr = None
         if not target:
             log(f"Device not found, retrying in {backoff}s...")
+            if sys.platform == "darwin" and backoff >= 16:
+                reset_cb_manager()  # refresh a possibly-stale central before the watchdog kicks in
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=backoff)
             except asyncio.TimeoutError:
@@ -525,6 +566,7 @@ async def main() -> None:
                 # No string cache to drop; instead skip this stale handle on
                 # the next retrieveConnected so the scan fallback is reachable.
                 skip_addr = addr
+                reset_cb_manager()  # rebuild a fresh central in case it went stale
             else:
                 log("Invalidating cached address")
                 SAVED_ADDR_FILE.unlink(missing_ok=True)
