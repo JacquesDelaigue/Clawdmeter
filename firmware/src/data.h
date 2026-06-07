@@ -19,6 +19,13 @@ struct SessionData {
     char model[16];     // short model id, e.g. "opus-4-8"
     int  ctx_pct;       // context-window utilization 0-100 (approximate)
     bool working;       // phase == "running"
+    // --- detail (best-effort; may be dropped by the daemon's byte budget) ---
+    char activity[40];  // current activity headline, e.g. "Edit ui.cpp" / "Idle"
+    int  todo_done;     // completed todos
+    int  todo_total;    // total todos (0 = no todo list)
+    char todo_now[40];  // the in-progress todo (activeForm), "" if none
+    int  idle_secs;     // seconds since this session last did anything
+    bool has_detail;    // false when the daemon dropped detail for this session
 };
 
 struct ActivityData {

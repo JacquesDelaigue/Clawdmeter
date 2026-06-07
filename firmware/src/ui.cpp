@@ -156,10 +156,29 @@ static lv_obj_t* activity_list = nullptr;       // scrollable flex column
 static lv_obj_t* activity_empty = nullptr;      // "No active sessions" placeholder
 static lv_obj_t* row_panel[MAX_SESSIONS];
 static lv_obj_t* row_proj[MAX_SESSIONS];
-static lv_obj_t* row_model[MAX_SESSIONS];
+static lv_obj_t* row_model[MAX_SESSIONS];   // repurposed as the running/idle status label
 static lv_obj_t* row_bar[MAX_SESSIONS];
 static lv_obj_t* row_pct[MAX_SESSIONS];
 static lv_obj_t* row_dot[MAX_SESSIONS];
+
+// ---- Session detail screen (drill-in from an Activity row) ----
+static lv_obj_t* detail_container = nullptr;
+static lv_obj_t* detail_proj = nullptr;     // header: project name
+static lv_obj_t* detail_model = nullptr;    // header: model id
+static lv_obj_t* detail_status = nullptr;   // header: "Running"/"Idle"
+static lv_obj_t* detail_idle = nullptr;     // header: "idle 5m" / "active now"
+static lv_obj_t* detail_ctx_bar = nullptr;
+static lv_obj_t* detail_ctx_pct = nullptr;
+static lv_obj_t* detail_act_panel = nullptr;  // "Doing" panel (detail-only)
+static lv_obj_t* detail_activity = nullptr;
+static lv_obj_t* detail_todo_panel = nullptr; // "To-dos" panel (detail-only)
+static lv_obj_t* detail_todo_lbl = nullptr;
+static lv_obj_t* detail_todo_bar = nullptr;
+static lv_obj_t* detail_todo_now = nullptr;
+static lv_obj_t* detail_unavail = nullptr;    // "Detail unavailable" note
+
+static ActivityData s_activity_cache = {};   // latest activity data, for the detail screen
+static int selected_session = -1;            // which row opened the detail screen
 
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
@@ -241,6 +260,16 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
+static void row_click_cb(lv_event_t* e);
+static void detail_back_cb(lv_event_t* e);
+
+// Format a "time since last activity" duration compactly: "12s" / "5m" / "1h 3m".
+static void fmt_idle(int secs, char* buf, size_t n) {
+    if (secs < 0) secs = 0;
+    if (secs < 60)        snprintf(buf, n, "%ds", secs);
+    else if (secs < 3600) snprintf(buf, n, "%dm", secs / 60);
+    else                  snprintf(buf, n, "%dh %dm", secs / 3600, (secs % 3600) / 60);
+}
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -482,6 +511,12 @@ static void build_activity_screen(lv_obj_t* scr) {
 
     for (int i = 0; i < MAX_SESSIONS; i++) {
         lv_obj_t* p = make_panel(activity_list, 0, 0, L.content_w, L.act_row_h);
+        // A row tap opens that session's detail screen. make_panel sets
+        // EVENT_BUBBLE (which would bubble the tap up to the screen-cycle
+        // handler) — clear it so a row tap only fires row_click_cb. Scrolling
+        // still works (it's driven by the scrollable list, not by bubbling).
+        lv_obj_clear_flag(p, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_event_cb(p, row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
 
         row_proj[i] = lv_label_create(p);
         lv_label_set_long_mode(row_proj[i], LV_LABEL_LONG_DOT);
@@ -532,6 +567,191 @@ static void build_activity_screen(lv_obj_t* scr) {
     lv_obj_add_flag(activity_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ======== Session Detail Screen ========
+// Drill-in from an Activity row. Shows everything we have on one session:
+// project + model + running/idle + idle-time (header), context-% (bar), the
+// current activity ("Doing"), and to-do progress. Tap anywhere → back to list.
+
+static void build_session_detail_screen(lv_obj_t* scr) {
+    detail_container = lv_obj_create(scr);
+    lv_obj_set_size(detail_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(detail_container, 0, 0);
+    lv_obj_set_style_bg_opa(detail_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(detail_container, 0, 0);
+    lv_obj_set_style_pad_all(detail_container, 0, 0);
+    lv_obj_clear_flag(detail_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(detail_container, detail_back_cb, LV_EVENT_CLICKED, NULL);
+
+    // Vertical stack of cards below the logo/battery zone.
+    lv_obj_t* col = lv_obj_create(detail_container);
+    lv_obj_set_pos(col, 0, L.content_y);
+    lv_obj_set_size(col, L.scr_w, L.scr_h - L.content_y);
+    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_pad_left(col, L.margin, 0);
+    lv_obj_set_style_pad_right(col, L.margin, 0);
+    lv_obj_set_style_pad_top(col, 0, 0);
+    lv_obj_set_style_pad_bottom(col, L.margin, 0);
+    lv_obj_set_style_pad_row(col, L.act_row_gap, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(col, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_add_flag(col, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    const int inner_w = L.content_w - 32;  // inside a panel's 16px L/R padding
+
+    // --- Header card: project + status / model + idle-time ---
+    lv_obj_t* hdr = make_panel(col, 0, 0, L.content_w, L.act_row_h);
+
+    detail_proj = lv_label_create(hdr);
+    lv_label_set_long_mode(detail_proj, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(detail_proj, inner_w - 90);
+    lv_obj_set_style_text_font(detail_proj, L.act_proj_font, 0);
+    lv_obj_set_style_text_color(detail_proj, COL_TEXT, 0);
+    lv_label_set_text(detail_proj, "");
+    lv_obj_align(detail_proj, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    detail_status = lv_label_create(hdr);
+    lv_obj_set_style_text_font(detail_status, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_status, COL_DIM, 0);
+    lv_label_set_text(detail_status, "");
+    lv_obj_align(detail_status, LV_ALIGN_TOP_RIGHT, 0, 2);
+
+    detail_model = lv_label_create(hdr);
+    lv_obj_set_style_text_font(detail_model, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_model, COL_DIM, 0);
+    lv_label_set_text(detail_model, "");
+    lv_obj_align(detail_model, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    detail_idle = lv_label_create(hdr);
+    lv_obj_set_style_text_font(detail_idle, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_idle, COL_DIM, 0);
+    lv_label_set_text(detail_idle, "");
+    lv_obj_align(detail_idle, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+
+    // --- Context card: caption + NN% / full-width bar ---
+    lv_obj_t* ctx = make_panel(col, 0, 0, L.content_w, L.act_row_h);
+
+    lv_obj_t* ctx_cap = lv_label_create(ctx);
+    lv_label_set_text(ctx_cap, "Context");
+    lv_obj_set_style_text_font(ctx_cap, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(ctx_cap, COL_DIM, 0);
+    lv_obj_align(ctx_cap, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    detail_ctx_pct = lv_label_create(ctx);
+    lv_obj_set_style_text_font(detail_ctx_pct, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_ctx_pct, COL_TEXT, 0);
+    lv_label_set_text(detail_ctx_pct, "");
+    lv_obj_align(detail_ctx_pct, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+    detail_ctx_bar = make_bar(ctx, 0, 0, inner_w, 12);
+    lv_obj_align(detail_ctx_bar, LV_ALIGN_BOTTOM_LEFT, 0, -2);
+
+    // --- "Doing" card: current activity (detail-only) ---
+    detail_act_panel = make_panel(col, 0, 0, L.content_w, L.act_row_h + 8);
+
+    lv_obj_t* act_cap = lv_label_create(detail_act_panel);
+    lv_label_set_text(act_cap, "Doing");
+    lv_obj_set_style_text_font(act_cap, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(act_cap, COL_DIM, 0);
+    lv_obj_align(act_cap, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    detail_activity = lv_label_create(detail_act_panel);
+    lv_label_set_long_mode(detail_activity, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(detail_activity, inner_w);
+    lv_obj_set_style_text_font(detail_activity, L.act_proj_font, 0);
+    lv_obj_set_style_text_color(detail_activity, COL_TEXT, 0);
+    lv_label_set_text(detail_activity, "");
+    lv_obj_align(detail_activity, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    // --- To-dos card: "N/M" + progress bar + in-progress item (detail-only) ---
+    detail_todo_panel = make_panel(col, 0, 0, L.content_w, L.act_row_h + 18);
+
+    detail_todo_lbl = lv_label_create(detail_todo_panel);
+    lv_label_set_text(detail_todo_lbl, "To-dos");
+    lv_obj_set_style_text_font(detail_todo_lbl, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_todo_lbl, COL_TEXT, 0);
+    lv_obj_align(detail_todo_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    detail_todo_bar = make_bar(detail_todo_panel, 0, 0, inner_w, 10);
+    lv_obj_set_style_bg_color(detail_todo_bar, COL_ACCENT, LV_PART_INDICATOR);
+    lv_obj_align(detail_todo_bar, LV_ALIGN_CENTER, 0, 0);
+
+    detail_todo_now = lv_label_create(detail_todo_panel);
+    lv_label_set_long_mode(detail_todo_now, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(detail_todo_now, inner_w);
+    lv_obj_set_style_text_font(detail_todo_now, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_todo_now, COL_DIM, 0);
+    lv_label_set_text(detail_todo_now, "");
+    lv_obj_align(detail_todo_now, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    // Shown instead of the Doing/To-dos cards when the daemon dropped detail
+    // for this session to fit the BLE payload.
+    detail_unavail = lv_label_create(col);
+    lv_label_set_long_mode(detail_unavail, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(detail_unavail, L.content_w);
+    lv_label_set_text(detail_unavail, "Detail unavailable\n(too many active sessions)");
+    lv_obj_set_style_text_font(detail_unavail, L.act_meta_font, 0);
+    lv_obj_set_style_text_color(detail_unavail, COL_DIM, 0);
+    lv_obj_set_style_text_align(detail_unavail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(detail_unavail, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_flag(detail_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+void ui_update_session_detail(const SessionData* s) {
+    if (!detail_container || !s) return;
+
+    lv_label_set_text(detail_proj, s->project[0] ? s->project : "(session)");
+    lv_label_set_text(detail_model, s->model);
+
+    if (s->working) {
+        lv_label_set_text(detail_status, "Running");
+        lv_obj_set_style_text_color(detail_status, COL_ACCENT, 0);
+        lv_label_set_text(detail_idle, "active now");
+    } else {
+        lv_label_set_text(detail_status, "Idle");
+        lv_obj_set_style_text_color(detail_status, COL_DIM, 0);
+        char t[16], ibuf[24];
+        fmt_idle(s->idle_secs, t, sizeof(t));
+        snprintf(ibuf, sizeof(ibuf), "idle %s", t);
+        lv_label_set_text(detail_idle, ibuf);
+    }
+
+    int p = s->ctx_pct; if (p < 0) p = 0; if (p > 100) p = 100;
+    lv_bar_set_value(detail_ctx_bar, p, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(detail_ctx_bar, pct_color((float)p), LV_PART_INDICATOR);
+    lv_label_set_text_fmt(detail_ctx_pct, "%d%%", p);
+
+    if (s->has_detail) {
+        lv_obj_clear_flag(detail_act_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(detail_todo_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(detail_unavail, LV_OBJ_FLAG_HIDDEN);
+
+        lv_label_set_text(detail_activity, s->activity[0] ? s->activity : "Idle");
+
+        if (s->todo_total > 0) {
+            lv_label_set_text_fmt(detail_todo_lbl, "To-dos  %d/%d", s->todo_done, s->todo_total);
+            lv_bar_set_value(detail_todo_bar, 100 * s->todo_done / s->todo_total, LV_ANIM_OFF);
+            lv_obj_clear_flag(detail_todo_bar, LV_OBJ_FLAG_HIDDEN);
+            // The in-progress item, marked active by brand-orange text (the
+            // Styrene font has no arrow glyph to prefix it with).
+            lv_label_set_text(detail_todo_now, s->todo_now);
+            lv_obj_set_style_text_color(detail_todo_now,
+                                        s->todo_now[0] ? COL_ACCENT : COL_DIM, 0);
+        } else {
+            lv_label_set_text(detail_todo_lbl, "No to-dos");
+            lv_bar_set_value(detail_todo_bar, 0, LV_ANIM_OFF);
+            lv_obj_add_flag(detail_todo_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(detail_todo_now, "");
+        }
+    } else {
+        lv_obj_add_flag(detail_act_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(detail_todo_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(detail_unavail, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -546,6 +766,7 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     build_activity_screen(scr);
+    build_session_detail_screen(scr);
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -588,13 +809,25 @@ void ui_update(const UsageData* data) {
 
 void ui_update_activity(const ActivityData* data) {
     if (!activity_list) return;
+    if (data) s_activity_cache = *data;   // keep latest for the detail screen
     int n = (data && data->valid) ? data->count : 0;
     if (n > MAX_SESSIONS) n = MAX_SESSIONS;
     for (int i = 0; i < MAX_SESSIONS; i++) {
         if (i < n) {
             const SessionData& s = data->sessions[i];
             lv_label_set_text(row_proj[i], s.project[0] ? s.project : "(session)");
-            lv_label_set_text(row_model[i], s.model);
+            // row_model is repurposed as the running/idle status (model lives
+            // on the detail screen now).
+            if (s.working) {
+                lv_label_set_text(row_model[i], "Running");
+                lv_obj_set_style_text_color(row_model[i], COL_ACCENT, 0);
+            } else {
+                char t[16], sbuf[24];
+                fmt_idle(s.idle_secs, t, sizeof(t));
+                snprintf(sbuf, sizeof(sbuf), "idle %s", t);
+                lv_label_set_text(row_model[i], sbuf);
+                lv_obj_set_style_text_color(row_model[i], COL_DIM, 0);
+            }
             int p = s.ctx_pct; if (p < 0) p = 0; if (p > 100) p = 100;
             lv_bar_set_value(row_bar[i], p, LV_ANIM_OFF);
             lv_obj_set_style_bg_color(row_bar[i], pct_color((float)p), LV_PART_INDICATOR);
@@ -608,6 +841,15 @@ void ui_update_activity(const ActivityData* data) {
     }
     if (n == 0) lv_obj_clear_flag(activity_empty, LV_OBJ_FLAG_HIDDEN);
     else        lv_obj_add_flag(activity_empty, LV_OBJ_FLAG_HIDDEN);
+
+    // Keep an open detail screen live; drop back to the list if its session
+    // has disappeared (count shrank / pruned).
+    if (current_screen == SCREEN_SESSION_DETAIL) {
+        if (selected_session >= 0 && selected_session < n)
+            ui_update_session_detail(&s_activity_cache.sessions[selected_session]);
+        else
+            ui_show_screen(SCREEN_ACTIVITY);
+    }
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -696,7 +938,9 @@ static void apply_work_mini_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    // Tap cycles SPLASH -> USAGE -> ACTIVITY -> SPLASH.
+    // Tap (on the heading / empty area) cycles SPLASH -> USAGE -> ACTIVITY ->
+    // SPLASH. Session detail is reached via row_click_cb and left via
+    // detail_back_cb — it is NOT part of this ring.
     switch (current_screen) {
         case SCREEN_SPLASH:   ui_show_screen(SCREEN_USAGE);    break;
         case SCREEN_USAGE:    ui_show_screen(SCREEN_ACTIVITY); break;
@@ -705,19 +949,38 @@ static void global_click_cb(lv_event_t* e) {
     }
 }
 
+// Tap on an Activity row → open that session's detail screen.
+static void row_click_cb(lv_event_t* e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_activity_cache.count) return;
+    selected_session = idx;
+    ui_update_session_detail(&s_activity_cache.sessions[idx]);
+    ui_show_screen(SCREEN_SESSION_DETAIL);
+}
+
+// Tap anywhere on the detail screen → back to the Activity list.
+static void detail_back_cb(lv_event_t* e) {
+    (void)e;
+    ui_show_screen(SCREEN_ACTIVITY);
+}
+
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     if (activity_container) lv_obj_add_flag(activity_container, LV_OBJ_FLAG_HIDDEN);
+    if (detail_container)   lv_obj_add_flag(detail_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:   splash_show(); break;
     case SCREEN_USAGE:    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_ACTIVITY: if (activity_container) lv_obj_clear_flag(activity_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SESSION_DETAIL: if (detail_container) lv_obj_clear_flag(detail_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
-    if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
+    // Record the last "main" screen for the PWR/idle splash toggle. Detail is a
+    // transient drill-in, so toggling splash should return to the list, not detail.
+    if (screen == SCREEN_USAGE || screen == SCREEN_ACTIVITY) prev_non_splash_screen = screen;
     current_screen = screen;
     apply_logo_visibility();
     apply_work_mini_visibility();
