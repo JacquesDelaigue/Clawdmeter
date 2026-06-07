@@ -155,11 +155,12 @@ static lv_obj_t* activity_container = nullptr;
 static lv_obj_t* activity_list = nullptr;       // scrollable flex column
 static lv_obj_t* activity_empty = nullptr;      // "No active sessions" placeholder
 static lv_obj_t* row_panel[MAX_SESSIONS];
-static lv_obj_t* row_proj[MAX_SESSIONS];
-static lv_obj_t* row_model[MAX_SESSIONS];   // repurposed as the running/idle status label
+static lv_obj_t* row_proj[MAX_SESSIONS];      // session name (top-left, title font)
+static lv_obj_t* row_modelbig[MAX_SESSIONS];  // model e.g. "Opus 4.8" (top-right, title font)
+static lv_obj_t* row_status[MAX_SESSIONS];    // "Running"/"idle 5m" (bottom-left)
+static lv_obj_t* row_effort[MAX_SESSIONS];    // effort e.g. "xhigh" (bottom, left of %)
 static lv_obj_t* row_bar[MAX_SESSIONS];
 static lv_obj_t* row_pct[MAX_SESSIONS];
-static lv_obj_t* row_dot[MAX_SESSIONS];
 
 // ---- Session detail screen (drill-in from an Activity row) ----
 static lv_obj_t* detail_container = nullptr;
@@ -262,6 +263,23 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 static void global_click_cb(lv_event_t* e);
 static void row_click_cb(lv_event_t* e);
 static void detail_back_cb(lv_event_t* e);
+
+// Pretty-print a short model id for display: "opus-4-8" -> "Opus 4.8",
+// "sonnet-4-6" -> "Sonnet 4.6". Family capitalized; version dashes -> dots.
+static void format_model(const char* m, char* out, size_t n) {
+    if (!m || !m[0]) { if (n) out[0] = '\0'; return; }
+    char fam[16] = {0}, ver[16] = {0};
+    int i = 0;
+    while (m[i] && m[i] != '-' && i < (int)sizeof(fam) - 1) { fam[i] = m[i]; i++; }
+    fam[i] = '\0';
+    if (m[i] == '-') i++;
+    int j = 0;
+    while (m[i] && j < (int)sizeof(ver) - 1) { ver[j++] = (m[i] == '-') ? '.' : m[i]; i++; }
+    ver[j] = '\0';
+    if (fam[0] >= 'a' && fam[0] <= 'z') fam[0] -= 32;  // capitalize family
+    if (ver[0]) snprintf(out, n, "%s %s", fam, ver);
+    else        snprintf(out, n, "%s", fam);
+}
 
 // Format a "time since last activity" duration compactly: "12s" / "5m" / "1h 3m".
 static void fmt_idle(int secs, char* buf, size_t n) {
@@ -518,40 +536,55 @@ static void build_activity_screen(lv_obj_t* scr) {
         lv_obj_clear_flag(p, LV_OBJ_FLAG_EVENT_BUBBLE);
         lv_obj_add_event_cb(p, row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
 
+        // --- top line: session name (left) + model (right), both title font ---
         row_proj[i] = lv_label_create(p);
         lv_label_set_long_mode(row_proj[i], LV_LABEL_LONG_DOT);
-        lv_obj_set_width(row_proj[i], inner_w - 26);  // leave room for the dot
+        lv_obj_set_width(row_proj[i], (int)(inner_w * 0.52f));
         lv_obj_set_style_text_font(row_proj[i], L.act_proj_font, 0);
         lv_obj_set_style_text_color(row_proj[i], COL_TEXT, 0);
         lv_label_set_text(row_proj[i], "");
         lv_obj_align(row_proj[i], LV_ALIGN_TOP_LEFT, 0, 0);
 
-        row_dot[i] = lv_obj_create(p);
-        lv_obj_set_size(row_dot[i], 14, 14);
-        lv_obj_set_style_radius(row_dot[i], LV_RADIUS_CIRCLE, 0);
-        lv_obj_set_style_bg_color(row_dot[i], COL_ACCENT, 0);
-        lv_obj_set_style_bg_opa(row_dot[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(row_dot[i], 0, 0);
-        lv_obj_clear_flag(row_dot[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(row_dot[i], LV_OBJ_FLAG_EVENT_BUBBLE);
-        lv_obj_align(row_dot[i], LV_ALIGN_TOP_RIGHT, 0, 2);
+        row_modelbig[i] = lv_label_create(p);
+        lv_label_set_long_mode(row_modelbig[i], LV_LABEL_LONG_DOT);
+        lv_obj_set_width(row_modelbig[i], (int)(inner_w * 0.46f));
+        lv_obj_set_style_text_align(row_modelbig[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_text_font(row_modelbig[i], L.act_proj_font, 0);
+        lv_obj_set_style_text_color(row_modelbig[i], COL_TEXT, 0);
+        lv_label_set_text(row_modelbig[i], "");
+        lv_obj_align(row_modelbig[i], LV_ALIGN_TOP_RIGHT, 0, 0);
 
-        row_model[i] = lv_label_create(p);
-        lv_obj_set_style_text_font(row_model[i], L.act_meta_font, 0);
-        lv_obj_set_style_text_color(row_model[i], COL_DIM, 0);
-        lv_label_set_text(row_model[i], "");
-        lv_obj_align(row_model[i], LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-        row_bar[i] = make_bar(p, 0, 0, (int)(inner_w * 0.40f), 10);
+        // --- bottom line: status (left) · effort · % · bar (right) ---
+        row_bar[i] = make_bar(p, 0, 0, (int)(inner_w * 0.36f), 10);
         lv_obj_align(row_bar[i], LV_ALIGN_BOTTOM_RIGHT, 0, -3);
 
         row_pct[i] = lv_label_create(p);
-        lv_obj_set_width(row_pct[i], 56);  // fixed width + right-align so it never overlaps the bar
+        lv_obj_set_width(row_pct[i], 52);  // fixed width + right-align so it never overlaps the bar
         lv_obj_set_style_text_align(row_pct[i], LV_TEXT_ALIGN_RIGHT, 0);
         lv_obj_set_style_text_font(row_pct[i], L.act_meta_font, 0);
         lv_obj_set_style_text_color(row_pct[i], COL_TEXT, 0);
         lv_label_set_text(row_pct[i], "");
         lv_obj_align_to(row_pct[i], row_bar[i], LV_ALIGN_OUT_LEFT_MID, -6, 0);
+
+        row_effort[i] = lv_label_create(p);
+        lv_obj_set_width(row_effort[i], 64);
+        lv_obj_set_style_text_align(row_effort[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_text_font(row_effort[i], L.act_meta_font, 0);
+        lv_obj_set_style_text_color(row_effort[i], COL_DIM, 0);
+        lv_label_set_text(row_effort[i], "");
+        lv_obj_align_to(row_effort[i], row_pct[i], LV_ALIGN_OUT_LEFT_MID, -8, 0);
+
+        row_status[i] = lv_label_create(p);
+        lv_label_set_long_mode(row_status[i], LV_LABEL_LONG_DOT);
+        // Width = whatever's left after the right-side cluster (bar+%+effort),
+        // so the status text can never overlap it on a narrow board.
+        int status_w = inner_w - (int)(inner_w * 0.36f) - 52 - 64 - 24;
+        if (status_w < 40) status_w = 40;
+        lv_obj_set_width(row_status[i], status_w);
+        lv_obj_set_style_text_font(row_status[i], L.act_meta_font, 0);
+        lv_obj_set_style_text_color(row_status[i], COL_DIM, 0);
+        lv_label_set_text(row_status[i], "");
+        lv_obj_align(row_status[i], LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
         lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
         row_panel[i] = p;
@@ -703,7 +736,15 @@ void ui_update_session_detail(const SessionData* s) {
     if (!detail_container || !s) return;
 
     lv_label_set_text(detail_proj, s->project[0] ? s->project : "(session)");
-    lv_label_set_text(detail_model, s->model);
+    char mbuf[20];
+    format_model(s->model, mbuf, sizeof(mbuf));
+    if (s->effort[0]) {
+        char ml[32];
+        snprintf(ml, sizeof(ml), "%s (%s)", mbuf, s->effort);  // "Opus 4.8 (xhigh)"
+        lv_label_set_text(detail_model, ml);
+    } else {
+        lv_label_set_text(detail_model, mbuf);
+    }
 
     if (s->working) {
         lv_label_set_text(detail_status, "Running");
@@ -816,24 +857,27 @@ void ui_update_activity(const ActivityData* data) {
         if (i < n) {
             const SessionData& s = data->sessions[i];
             lv_label_set_text(row_proj[i], s.project[0] ? s.project : "(session)");
-            // row_model is repurposed as the running/idle status (model lives
-            // on the detail screen now).
+            // model, big, top-right (e.g. "Opus 4.8")
+            char mbuf[20];
+            format_model(s.model, mbuf, sizeof(mbuf));
+            lv_label_set_text(row_modelbig[i], mbuf);
+            // running/idle status, bottom-left
             if (s.working) {
-                lv_label_set_text(row_model[i], "Running");
-                lv_obj_set_style_text_color(row_model[i], COL_ACCENT, 0);
+                lv_label_set_text(row_status[i], "Running");
+                lv_obj_set_style_text_color(row_status[i], COL_ACCENT, 0);
             } else {
                 char t[16], sbuf[24];
                 fmt_idle(s.idle_secs, t, sizeof(t));
                 snprintf(sbuf, sizeof(sbuf), "idle %s", t);
-                lv_label_set_text(row_model[i], sbuf);
-                lv_obj_set_style_text_color(row_model[i], COL_DIM, 0);
+                lv_label_set_text(row_status[i], sbuf);
+                lv_obj_set_style_text_color(row_status[i], COL_DIM, 0);
             }
+            // effort, bottom, left of the %
+            lv_label_set_text(row_effort[i], s.effort);
             int p = s.ctx_pct; if (p < 0) p = 0; if (p > 100) p = 100;
             lv_bar_set_value(row_bar[i], p, LV_ANIM_OFF);
             lv_obj_set_style_bg_color(row_bar[i], pct_color((float)p), LV_PART_INDICATOR);
             lv_label_set_text_fmt(row_pct[i], "%d%%", p);
-            if (s.working) lv_obj_clear_flag(row_dot[i], LV_OBJ_FLAG_HIDDEN);
-            else           lv_obj_add_flag(row_dot[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(row_panel[i], LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(row_panel[i], LV_OBJ_FLAG_HIDDEN);

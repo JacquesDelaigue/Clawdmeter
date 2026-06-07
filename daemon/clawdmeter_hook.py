@@ -172,6 +172,7 @@ def _update(payload: dict) -> None:
             "cwd": "",
             "project": "",
             "model": "",
+            "effort": "",
             "last_tool": "",
             "current_tool": "",
             "current_tool_args": "",
@@ -188,6 +189,12 @@ def _update(payload: dict) -> None:
             session["project"] = _short_project(payload["cwd"])
         if "model" in payload:
             session["model"] = _short_model(payload["model"])
+        # Effort level (low/medium/high/xhigh/max). Present on tool-context
+        # events (PreToolUse/PostToolUse/Stop) as {"effort": {"level": ...}};
+        # absent on UserPromptSubmit/SessionStart, so keep the prior value then.
+        eff = payload.get("effort")
+        if isinstance(eff, dict) and eff.get("level"):
+            session["effort"] = str(eff["level"])[:7]
         session["last_active_ts"] = now
 
         # Context-window % from the session transcript (best-effort, fail-open).
