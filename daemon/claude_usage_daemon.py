@@ -37,6 +37,7 @@ CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 STATE_FILE = Path.home() / ".clawdmeter" / "state.json"  # written by clawdmeter_hook.py
 WORKING_STALE_SECONDS = 120  # ignore a session's phase=="running" older than this (missed-Stop guard)
+SESSION_LIST_SECONDS = 15 * 60  # keep idle sessions in the Activity list this long (matches the hook's TTL) so idle-time stays meaningful
 MAX_SESSIONS = 5             # cap the Activity-screen list sent over BLE
 MAX_BLE_PAYLOAD = 480        # keep under NimBLE's 512-byte attribute cap
 # Auto-recovery: if no successful BLE write lands for this long, exit non-zero so
@@ -160,13 +161,42 @@ def read_working() -> bool:
     return False
 
 
-def read_sessions() -> list:
-    """Compact per-session activity list for the device's Activity screen.
+def _activity_summary(s: dict) -> str:
+    """One-line 'what is this session doing right now', e.g. 'Edit ui.cpp' or
+    'Bash npm test'. Empty when the session is idle / nothing notable."""
+    tool = (s.get("current_tool") or "").strip()
+    if not tool:
+        return ""
+    args = (s.get("current_tool_args") or "").strip()
+    return f"{tool} {args}".strip()[:38]
 
-    Reads ~/.clawdmeter/state.json, keeps sessions active within
-    WORKING_STALE_SECONDS, sorts most-recently-active first, caps at
-    MAX_SESSIONS, and emits short keys to keep the BLE payload small:
-      p=project, m=model, c=context-%, w=running flag.
+
+def _todo_progress(s: dict):
+    """Return (done, total, in_progress_text) for a session's to-do list."""
+    todos = s.get("todos") or []
+    if not isinstance(todos, list):
+        return 0, 0, ""
+    done = sum(1 for t in todos if isinstance(t, dict) and t.get("status") == "completed")
+    now_txt = ""
+    for t in todos:
+        if isinstance(t, dict) and t.get("status") == "in_progress":
+            now_txt = (t.get("activeForm") or t.get("content") or "")[:38]
+            break
+    return done, len(todos), now_txt
+
+
+def read_sessions() -> list:
+    """Per-session activity list for the device's Activity screen.
+
+    Reads ~/.clawdmeter/state.json, keeps sessions seen within
+    SESSION_LIST_SECONDS (so idle sessions stay listed long enough for their
+    idle-time to be meaningful), sorts most-recently-active first, caps at
+    MAX_SESSIONS, and emits short keys to keep the BLE payload small.
+
+    Always-present (lightweight, fits any payload): p=project, m=model,
+    c=context-%, w=running flag, i=idle seconds. Detail fields, added by the
+    caller's budget pass only when they fit: a=activity, td/tt=todo done/total,
+    tn=in-progress todo.
     """
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -177,17 +207,61 @@ def read_sessions() -> list:
         return []
     now = time.time()
     fresh = [s for s in sessions.values()
-             if isinstance(s, dict) and (now - s.get("last_active_ts", 0)) < WORKING_STALE_SECONDS]
+             if isinstance(s, dict) and (now - s.get("last_active_ts", 0)) < SESSION_LIST_SECONDS]
     fresh.sort(key=lambda s: s.get("last_active_ts", 0), reverse=True)
     out = []
     for s in fresh[:MAX_SESSIONS]:
+        idle = int(max(0, now - s.get("last_active_ts", 0)))
+        # A session whose phase is "running" but which hasn't moved in
+        # WORKING_STALE_SECONDS (missed Stop) reads as idle, not stuck-running.
+        running = s.get("phase") == "running" and idle < WORKING_STALE_SECONDS
+        done, total, todo_now = _todo_progress(s)
         out.append({
             "p": (s.get("project") or "")[:23],
             "m": (s.get("model") or "")[:15],
             "c": int(s.get("ctx_pct", 0) or 0),
-            "w": 1 if s.get("phase") == "running" else 0,
+            "w": 1 if running else 0,
+            "i": idle,
+            # detail fields (the byte-budget pass strips these from older
+            # sessions if the payload would overflow):
+            "a": _activity_summary(s) if running else "Idle",
+            "td": done,
+            "tt": total,
+            "tn": todo_now,
         })
     return out
+
+
+# Keys that make up the lightweight, always-sent part of a session entry.
+_SESSION_LIST_KEYS = ("p", "m", "c", "w", "i")
+# Detail keys, dropped oldest-first when the payload would exceed MAX_BLE_PAYLOAD.
+_SESSION_DETAIL_KEYS = ("a", "td", "tt", "tn")
+
+
+def fit_sessions(base_payload: dict, sessions: list) -> list:
+    """Trim a session list so the full serialized payload stays under
+    MAX_BLE_PAYLOAD. The lightweight list (p/m/c/w/i for every session) is
+    always kept; detail fields (a/td/tt/tn) are dropped from the
+    oldest sessions first until it fits. Returns the (possibly trimmed) list."""
+    sessions = [dict(s) for s in sessions]  # don't mutate caller's dicts
+
+    def size_with(sess):
+        cand = dict(base_payload)
+        cand["sessions"] = sess
+        return len(json.dumps(cand, separators=(",", ":")))
+
+    # Strip detail from the end (oldest) until it fits, or all detail is gone.
+    i = len(sessions) - 1
+    while size_with(sessions) > MAX_BLE_PAYLOAD and i >= 0:
+        if any(k in sessions[i] for k in _SESSION_DETAIL_KEYS):
+            for k in _SESSION_DETAIL_KEYS:
+                sessions[i].pop(k, None)
+        else:
+            i -= 1  # this one is already list-only; move to the next-oldest
+    # If even the bare list overflows, drop whole sessions (oldest first).
+    while sessions and size_with(sessions) > MAX_BLE_PAYLOAD:
+        sessions = sessions[:-1]
+    return sessions
 
 
 def load_cached_address() -> str | None:
@@ -465,14 +539,12 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
             if last_payload is not None:
                 working = read_working()
                 sessions = read_sessions()
-                # Keep the payload under the BLE attribute cap: test the size and
-                # drop the oldest sessions until it fits.
-                candidate = dict(last_payload)
-                candidate["working"] = working
-                candidate["sessions"] = sessions
-                while sessions and len(json.dumps(candidate, separators=(",", ":"))) > MAX_BLE_PAYLOAD:
-                    sessions = sessions[:-1]
-                    candidate["sessions"] = sessions
+                # Keep the payload under the BLE attribute cap. The lightweight
+                # per-session list always fits; fit_sessions drops detail fields
+                # (then whole sessions) oldest-first only if needed.
+                base = {k: v for k, v in last_payload.items() if k != "sessions"}
+                base["working"] = working
+                sessions = fit_sessions(base, sessions)
                 push = do_poll or (state_changed and (
                     last_payload.get("working") != working
                     or last_payload.get("sessions") != sessions))

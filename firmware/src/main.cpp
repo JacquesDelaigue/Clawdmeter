@@ -126,6 +126,14 @@ static bool parse_json(const char* json, UsageData* out, ActivityData* act) {
             strlcpy(sd.model,   s["m"] | "", sizeof(sd.model));
             sd.ctx_pct = s["c"] | 0;
             sd.working = ((int)(s["w"] | 0)) != 0;
+            sd.idle_secs = s["i"] | 0;
+            // Detail fields are best-effort: the daemon drops them (key "a"
+            // absent) for older sessions when the BLE payload would overflow.
+            sd.has_detail = s["a"].is<const char*>();
+            strlcpy(sd.activity, s["a"] | "", sizeof(sd.activity));
+            sd.todo_done  = s["td"] | 0;
+            sd.todo_total = s["tt"] | 0;
+            strlcpy(sd.todo_now, s["tn"] | "", sizeof(sd.todo_now));
             act->count++;
         }
     }
