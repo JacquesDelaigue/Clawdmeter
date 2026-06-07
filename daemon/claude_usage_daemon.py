@@ -219,6 +219,7 @@ def read_sessions() -> list:
         out.append({
             "p": (s.get("project") or "")[:23],
             "m": (s.get("model") or "")[:15],
+            "e": (s.get("effort") or "")[:7],
             "c": int(s.get("ctx_pct", 0) or 0),
             "w": 1 if running else 0,
             "i": idle,
@@ -233,7 +234,7 @@ def read_sessions() -> list:
 
 
 # Keys that make up the lightweight, always-sent part of a session entry.
-_SESSION_LIST_KEYS = ("p", "m", "c", "w", "i")
+_SESSION_LIST_KEYS = ("p", "m", "e", "c", "w", "i")
 # Detail keys, dropped oldest-first when the payload would exceed MAX_BLE_PAYLOAD.
 _SESSION_DETAIL_KEYS = ("a", "td", "tt", "tn")
 

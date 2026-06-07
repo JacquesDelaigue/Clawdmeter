@@ -17,6 +17,7 @@ struct UsageData {
 struct SessionData {
     char project[24];   // short project name (cwd basename)
     char model[16];     // short model id, e.g. "opus-4-8"
+    char effort[8];     // effort level, e.g. "xhigh"/"max"/"high"/"medium"/"low"
     int  ctx_pct;       // context-window utilization 0-100 (approximate)
     bool working;       // phase == "running"
     // --- detail (best-effort; may be dropped by the daemon's byte budget) ---

@@ -124,6 +124,7 @@ static bool parse_json(const char* json, UsageData* out, ActivityData* act) {
             SessionData& sd = act->sessions[act->count];
             strlcpy(sd.project, s["p"] | "", sizeof(sd.project));
             strlcpy(sd.model,   s["m"] | "", sizeof(sd.model));
+            strlcpy(sd.effort,  s["e"] | "", sizeof(sd.effort));
             sd.ctx_pct = s["c"] | 0;
             sd.working = ((int)(s["w"] | 0)) != 0;
             sd.idle_secs = s["i"] | 0;
@@ -239,6 +240,12 @@ void setup() {
     lv_indev_t* indev = lv_indev_create();
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
+    // A finger tap on a touch panel always drags a few pixels. The default
+    // 10px scroll threshold is low enough that taps on a scrollable list (the
+    // Activity screen with 4+ sessions) get misread as scrolls, which
+    // suppresses the CLICKED event and stops a row from opening its detail.
+    // Raise it so casual taps stay taps; deliberate drags still scroll.
+    lv_indev_set_scroll_limit(indev, 40);
 
     ble_init();
     input_hal_init();
