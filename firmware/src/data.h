@@ -10,6 +10,8 @@ struct UsageData {
     bool ok;                 // data parse succeeded
     bool working;            // any Claude Code session is actively running (daemon "working")
     bool valid;              // false until first successful parse
+    char host[40];           // daemon LAN address (BLE payload "host"), for WiFi fallback; "" if absent
+    int  port;               // daemon HTTP port (BLE payload "port"); 0 if absent
 };
 
 #define MAX_SESSIONS 5

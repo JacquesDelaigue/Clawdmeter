@@ -12,10 +12,14 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from bleak import BleakClient, BleakScanner
@@ -44,6 +48,19 @@ MAX_BLE_PAYLOAD = 480        # keep under NimBLE's 512-byte attribute cap
 # launchd relaunches us with a fresh CoreBluetooth stack — the proven fix after
 # the Mac sleeps and the link wedges. (plist KeepAlive restarts us ~10s later.)
 STALE_RESTART_SECONDS = 300
+
+# --- WiFi fallback transport -------------------------------------------------
+# A tiny LAN HTTP endpoint serving the same payload the device gets over BLE, so
+# the screen keeps updating when it's out of Bluetooth range (see the firmware's
+# wifi_transport.cpp). Bound to all interfaces so the device can reach it on the
+# local network. The daemon stamps its own LAN IP + this port into the BLE
+# payload, so the device learns where to pull from with no hardcoded address.
+HTTP_HOST = "0.0.0.0"
+HTTP_PORT = int(os.environ.get("CLAWDMETER_PORT", "47800"))
+# Optional shared secret. If set (here or via the env var), /usage requires a
+# matching ?token=. Must equal WIFI_TOKEN in the firmware's wifi_cfg.h. Empty =
+# open endpoint (fine on a trusted home/office LAN).
+HTTP_TOKEN = os.environ.get("CLAWDMETER_TOKEN", "")
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -311,6 +328,16 @@ async def scan_for_device() -> str | None:
 _cb_manager = None  # reused CentralManagerDelegate (CoreBluetooth)
 _last_success_ts = 0.0  # time.time() of the last successful BLE write (for the watchdog)
 
+# Shared latest payload — produced by the poller task, consumed by BOTH the BLE
+# sender and the HTTP server. Guarded by a plain threading.Lock because the HTTP
+# handler runs in its own thread; the asyncio side only holds it briefly (never
+# across an await). The two asyncio.Events are created in main() once a loop is
+# running.
+_latest_payload: dict | None = None
+_latest_lock = threading.Lock()
+_payload_updated: asyncio.Event | None = None  # poller → BLE sender: a push-worthy change landed
+_force_poll: asyncio.Event | None = None        # BLE sender → poller: device asked for a refresh
+
 
 def reset_cb_manager() -> None:
     """Drop the cached CoreBluetooth central so the next lookup builds a fresh
@@ -460,6 +487,62 @@ async def poll_api(token: str) -> dict | None:
     return payload
 
 
+def lan_ip() -> str:
+    """Best-effort primary LAN IPv4 of this host. Opens a UDP socket toward a
+    public address (no packets are actually sent) so the OS picks the egress
+    interface, then reads back the local address it chose."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+class _UsageHandler(BaseHTTPRequestHandler):
+    """Serves the latest payload at GET /usage (token-checked if configured)."""
+
+    def _send(self, code: int, body: bytes = b"") -> None:
+        self.send_response(code)
+        if body:
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        u = urlparse(self.path)
+        if u.path != "/usage":
+            self._send(404)
+            return
+        if HTTP_TOKEN and parse_qs(u.query).get("token", [""])[0] != HTTP_TOKEN:
+            self._send(403)
+            return
+        with _latest_lock:
+            payload = _latest_payload
+        if payload is None:
+            self._send(503)  # nothing polled yet
+            return
+        self._send(200, json.dumps(payload, separators=(",", ":")).encode())
+
+    def log_message(self, *_args) -> None:  # silence per-request stderr spam
+        pass
+
+
+def start_http_server() -> None:
+    try:
+        srv = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), _UsageHandler)
+    except OSError as e:
+        log(f"HTTP server failed to bind {HTTP_HOST}:{HTTP_PORT}: {e} (WiFi fallback disabled)")
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    extra = " [token required]" if HTTP_TOKEN else ""
+    log(f"HTTP server on {lan_ip()}:{HTTP_PORT} (GET /usage){extra}")
+
+
 class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
@@ -486,13 +569,90 @@ class Session:
             return False
 
 
-async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
-    """Connect to a target and poll until disconnected or stopped.
+async def _wait_any(events, timeout: float) -> None:
+    """Return when any of the given asyncio.Events is set, or after `timeout`
+    seconds. `None` entries are ignored (events may not exist yet at startup)."""
+    events = [e for e in events if e is not None]
+    if not events:
+        await asyncio.sleep(timeout)
+        return
+    tasks = [asyncio.create_task(e.wait()) for e in events]
+    try:
+        await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
 
-    ``target`` is either an address string (Linux) or a BLEDevice carrying
-    live CoreBluetooth details (macOS). Returns True if the connection was
-    used successfully (so the caller keeps the cached address), False if the
-    connection failed and the cache should be invalidated.
+
+async def poller(stop_event: asyncio.Event) -> None:
+    """Poll the API + read the hook's state.json on a cadence, assemble the
+    payload, and publish it to _latest_payload for BOTH transports.
+
+    Runs independently of any BLE connection — that's what makes the WiFi
+    endpoint work when the device is out of Bluetooth range. The shared payload
+    is refreshed every cycle (so HTTP stays current), but the BLE sender is only
+    nudged (via _payload_updated) on a push-worthy change, preserving the
+    original poll-or-state-change push policy and BLE write frequency.
+    """
+    global _latest_payload
+    last_poll = 0.0
+    api_payload: dict | None = None
+    last_state_mtime = state_mtime()
+    pushed_working: bool | None = None
+    pushed_sessions: list | None = None
+    while not stop_event.is_set():
+        now = time.time()
+        forced = _force_poll is not None and _force_poll.is_set()
+        if forced:
+            _force_poll.clear()
+        do_poll = forced or (now - last_poll) >= POLL_INTERVAL
+        if do_poll:
+            token = read_token()
+            if not token:
+                log("No token; skipping poll")
+            else:
+                p = await poll_api(token)
+                if p is not None:
+                    api_payload = p
+                    last_poll = time.time()
+
+        if api_payload is not None:
+            mt = state_mtime()
+            state_changed = mt != last_state_mtime
+            last_state_mtime = mt
+            working = read_working()
+            sessions = read_sessions()
+            # Stamp our LAN address so the device learns where to pull over WiFi.
+            base = {k: v for k, v in api_payload.items() if k != "sessions"}
+            base["working"] = working
+            base["host"] = lan_ip()
+            base["port"] = HTTP_PORT
+            # Keep the payload under the BLE attribute cap (host/port included in
+            # the budget); the HTTP path serves the same capped payload.
+            sessions = fit_sessions(base, sessions)
+            payload = dict(base)
+            payload["sessions"] = sessions
+            with _latest_lock:
+                _latest_payload = payload
+            push = do_poll or (state_changed and (
+                working != pushed_working or sessions != pushed_sessions))
+            if push:
+                pushed_working = working
+                pushed_sessions = sessions
+                if _payload_updated is not None:
+                    _payload_updated.set()
+
+        await _wait_any([stop_event, _force_poll], TICK)
+
+
+async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
+    """Connect to the device and stream the shared payload over BLE until
+    disconnected or stopped. Polling now lives in poller(); this function only
+    SENDS, so it stays responsive and the API is polled regardless of BLE.
+
+    ``target`` is either an address string (Linux) or a BLEDevice carrying live
+    CoreBluetooth details (macOS). Returns True if at least one write succeeded
+    (so the caller keeps the cached address), False if the connection failed.
     """
     global _last_success_ts
     display = target if isinstance(target, str) else target.address
@@ -512,56 +672,30 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     session = Session(client)
     await session.setup_refresh_subscription()
 
-    last_poll = 0.0
-    last_payload: dict | None = None
-    last_state_mtime = state_mtime()
+    last_sent: dict | None = None
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
-            now = time.time()
-            elapsed = now - last_poll
-            do_poll = session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL
-            if do_poll:
+            if _payload_updated is not None:
+                _payload_updated.clear()  # clear before reading → no lost wakeups
+            # A device refresh request forces the poller to poll immediately.
+            if session.refresh_requested.is_set():
                 session.refresh_requested.clear()
-                token = read_token()
-                if not token:
-                    log("No token; skipping poll")
-                else:
-                    p = await poll_api(token)
-                    if p is not None:
-                        last_payload = p
+                if _force_poll is not None:
+                    _force_poll.set()
 
-            # "working" flag from the Claude Code hook's state.json. Push the
-            # cached payload immediately on a state change (no extra API call);
-            # otherwise it rides the regular API poll above.
-            mt = state_mtime()
-            state_changed = mt != last_state_mtime
-            last_state_mtime = mt
-            if last_payload is not None:
-                working = read_working()
-                sessions = read_sessions()
-                # Keep the payload under the BLE attribute cap. The lightweight
-                # per-session list always fits; fit_sessions drops detail fields
-                # (then whole sessions) oldest-first only if needed.
-                base = {k: v for k, v in last_payload.items() if k != "sessions"}
-                base["working"] = working
-                sessions = fit_sessions(base, sessions)
-                push = do_poll or (state_changed and (
-                    last_payload.get("working") != working
-                    or last_payload.get("sessions") != sessions))
-                last_payload["working"] = working
-                last_payload["sessions"] = sessions
-                if push:
-                    if await session.write_payload(last_payload):
-                        used_successfully = True
-                        _last_success_ts = time.time()
-                        if do_poll:
-                            last_poll = time.time()
+            with _latest_lock:
+                payload = dict(_latest_payload) if _latest_payload is not None else None
+            if payload is not None and payload != last_sent:
+                if await session.write_payload(payload):
+                    used_successfully = True
+                    _last_success_ts = time.time()
+                    last_sent = payload
 
-            try:
-                await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
-            except asyncio.TimeoutError:
-                pass
+            # Wake on the next poller update, a device refresh, or stop; cap the
+            # wait so a missed signal can't wedge us.
+            await _wait_any(
+                [stop_event, session.refresh_requested, _payload_updated], TICK)
     finally:
         try:
             await client.disconnect()
@@ -594,8 +728,10 @@ async def watchdog(stop_event: asyncio.Event) -> None:
 
 
 async def main() -> None:
-    global _last_success_ts
+    global _last_success_ts, _payload_updated, _force_poll
     _last_success_ts = time.time()  # grace period before the watchdog can fire
+    _payload_updated = asyncio.Event()
+    _force_poll = asyncio.Event()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -609,47 +745,60 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, _stop)
 
-    log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
+    log("=== Claude Usage Tracker Daemon (BLE + WiFi, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
+    start_http_server()
     loop.create_task(watchdog(stop_event))
+    loop.create_task(poller(stop_event))
 
     backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
-    while not stop_event.is_set():
-        # Apply any pending skip exactly once, then clear it so the next
-        # cycle re-tries retrieveConnected (the device may have recovered).
-        target = await discover_target(skip_addr=skip_addr)
-        skip_addr = None
-        if not target:
-            log(f"Device not found, retrying in {backoff}s...")
-            if sys.platform == "darwin" and backoff >= 16:
-                reset_cb_manager()  # refresh a possibly-stale central before the watchdog kicks in
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 60)
-            continue
+    async def backoff_wait() -> None:
+        nonlocal backoff
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, 60)
 
-        addr = target if isinstance(target, str) else target.address
-        ok = await connect_and_run(target, stop_event)
-        if not ok:
-            if sys.platform == "darwin":
-                # No string cache to drop; instead skip this stale handle on
-                # the next retrieveConnected so the scan fallback is reachable.
-                skip_addr = addr
-                reset_cb_manager()  # rebuild a fresh central in case it went stale
+    while not stop_event.is_set():
+        try:
+            # Apply any pending skip exactly once, then clear it so the next
+            # cycle re-tries retrieveConnected (the device may have recovered).
+            target = await discover_target(skip_addr=skip_addr)
+            skip_addr = None
+            if not target:
+                log(f"Device not found, retrying in {backoff}s...")
+                if sys.platform == "darwin" and backoff >= 16:
+                    reset_cb_manager()  # refresh a possibly-stale central before the watchdog kicks in
+                await backoff_wait()
+                continue
+
+            addr = target if isinstance(target, str) else target.address
+            ok = await connect_and_run(target, stop_event)
+            if not ok:
+                if sys.platform == "darwin":
+                    # No string cache to drop; instead skip this stale handle on
+                    # the next retrieveConnected so the scan fallback is reachable.
+                    skip_addr = addr
+                    reset_cb_manager()  # rebuild a fresh central in case it went stale
+                else:
+                    log("Invalidating cached address")
+                    SAVED_ADDR_FILE.unlink(missing_ok=True)
+                await backoff_wait()
             else:
-                log("Invalidating cached address")
-                SAVED_ADDR_FILE.unlink(missing_ok=True)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 60)
-        else:
-            backoff = 1
+                backoff = 1
+        except BleakError as e:
+            # Bluetooth adapter unavailable (e.g. powered off / asleep) or a
+            # transient stack fault. Previously this propagated out of
+            # asyncio.run() and killed the daemon, leaving the screen dark
+            # until a manual restart. Instead, wait and retry so the daemon
+            # self-heals the moment Bluetooth comes back.
+            log(f"Bluetooth unavailable ({e}); retrying in {backoff}s...")
+            if sys.platform == "darwin":
+                reset_cb_manager()  # drop the stale central; rebuild on next cycle
+            await backoff_wait()
 
 
 if __name__ == "__main__":
