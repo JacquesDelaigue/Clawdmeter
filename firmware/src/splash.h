@@ -16,11 +16,6 @@ void splash_next(void);
 void splash_show(void);
 void splash_hide(void);
 
-// Pick the next animation matching the current usage-rate group.
-// Called automatically by splash_show(); also exposed so other modules can
-// trigger a re-pick when the rate group changes mid-display.
-void splash_pick_for_current_rate(void);
-
 // True when splash is currently rendering (used to gate re-picks).
 bool splash_is_active(void);
 

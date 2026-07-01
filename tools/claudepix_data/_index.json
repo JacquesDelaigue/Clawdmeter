@@ -89,5 +89,12 @@
     "category": "Dance",
     "frame_count": 16,
     "palette_size": 10
+  },
+  {
+    "filename": "skate.html",
+    "name": "skate",
+    "category": "Dance",
+    "frame_count": 12,
+    "palette_size": 7
   }
 ]

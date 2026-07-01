@@ -315,14 +315,6 @@ static void pair_tick(void) {
 // Apply a freshly-parsed payload (in the file-scope `usage`/`activity`) to the
 // UI. Shared by the BLE and WiFi receive paths so both render identically.
 static void apply_usage(void) {
-    int g_before = usage_rate_group();
-    usage_rate_sample(usage.session_pct);
-    int g_after = usage_rate_group();
-    if (g_after != g_before) {
-        Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-            g_before, g_after, usage.session_pct);
-        if (splash_is_active()) splash_pick_for_current_rate();
-    }
     ui_update(&usage);
     ui_update_activity(&activity);
 

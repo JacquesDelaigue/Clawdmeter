@@ -1,7 +1,6 @@
 #include "splash.h"
 #include "splash_animations.h"
 #include "theme.h"
-#include "usage_rate.h"
 #include "hal/board_caps.h"
 #include <Arduino.h>
 #include <string.h>
@@ -43,39 +42,21 @@ static int      work_coding_idx = -1;      // resolved once in splash_init()
 // rate-driven group every this many ms.
 #define SPLASH_ROTATE_INTERVAL_MS 20000
 
-// Usage-rate animation groups: 4 groups × up to 4 animations each.
-// Filled at init by matching literal names from splash_anims[].
-#define GROUP_COUNT 4
-#define GROUP_MAX   4
-static int8_t  group_lists[GROUP_COUNT][GROUP_MAX];
-static uint8_t group_size[GROUP_COUNT] = {0};
-static uint8_t group_rotation[GROUP_COUNT] = {0};
+// Idle playlist: every animation EXCEPT the busy-only "work coding" (reserved
+// for working mode). While idle the splash round-robins through this list,
+// independent of usage rate. Built once at init.
+#define SPLASH_BUSY_ONLY "work coding"
+static int8_t  idle_list[SPLASH_ANIM_COUNT];
+static uint8_t idle_size = 0;
+static uint8_t idle_pos  = 0;
 
-static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
-    // Group 0 — idle / sleepy
-    { "expression sleep", "idle breathe", "idle blink", "expression wink" },
-    // Group 1 — normal pace
-    { "idle look around", "work think", "work coding", NULL },
-    // Group 2 — active
-    { "dance sway", "expression surprise", "dance bounce", NULL },
-    // Group 3 — heavy
-    { "dance bounce dj", "dance sway dj", "dance djmix", NULL },
-};
+static void splash_pick_next_idle(void);   // fwd decl (defined below, used by splash_tick)
 
-static void resolve_group_lists(void) {
-    for (int g = 0; g < GROUP_COUNT; g++) {
-        group_size[g] = 0;
-        for (int s = 0; s < GROUP_MAX; s++) {
-            group_lists[g][s] = -1;
-            const char* want = GROUP_NAMES[g][s];
-            if (!want) continue;
-            for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
-                if (strcmp(splash_anims[i].name, want) == 0) {
-                    group_lists[g][group_size[g]++] = (int8_t)i;
-                    break;
-                }
-            }
-        }
+static void build_idle_list(void) {
+    idle_size = 0;
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, SPLASH_BUSY_ONLY) == 0) continue;  // busy-only
+        idle_list[idle_size++] = (int8_t)i;
     }
 }
 
@@ -217,7 +198,7 @@ void splash_init(lv_obj_t *parent) {
     lv_obj_set_style_text_align(label_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(label_status);
 
-    resolve_group_lists();
+    build_idle_list();
 
     work_coding_idx = -1;
     for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
@@ -257,8 +238,8 @@ void splash_tick(void) {
             if (work_coding_idx >= 0) splash_show_index(work_coding_idx);
         }
     } else if (millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
-        // Auto-rotate to the next animation in the current rate group.
-        splash_pick_for_current_rate();
+        // Auto-rotate to the next idle animation (all except "work coding").
+        splash_pick_next_idle();
     }
 
     const splash_anim_def_t *a = &splash_anims[cur_anim];
@@ -284,23 +265,12 @@ void splash_next(void) {
     splash_note_manual();
 }
 
-void splash_pick_for_current_rate(void) {
-    if (SPLASH_ANIM_COUNT == 0) return;
-    int g = usage_rate_group();
-    if (g < 0 || g >= GROUP_COUNT) g = 0;
-    if (group_size[g] == 0) return;
-
-    uint8_t slot = group_rotation[g] % group_size[g];
-    group_rotation[g]++;
-    int8_t idx = group_lists[g][slot];
-    if (idx < 0) return;
-
-    cur_anim = (uint16_t)idx;
-    cur_frame = 0;
-    frame_started_ms = millis();
-    last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
+// Advance to the next animation in the idle playlist (round-robin, rate-independent).
+static void splash_pick_next_idle(void) {
+    if (idle_size == 0) return;
+    int8_t idx = idle_list[idle_pos % idle_size];
+    idle_pos++;
+    splash_show_index(idx);
 }
 
 bool splash_is_active(void) { return active; }
@@ -310,7 +280,7 @@ void splash_show(void) {
         splash_show_index(work_coding_idx);
         manual_override = false;
     } else {
-        splash_pick_for_current_rate();
+        splash_pick_next_idle();
     }
     if (splash_container) lv_obj_clear_flag(splash_container, LV_OBJ_FLAG_HIDDEN);
     active = true;
