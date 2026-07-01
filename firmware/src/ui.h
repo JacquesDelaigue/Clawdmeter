@@ -20,4 +20,5 @@ void ui_show_screen(screen_t screen);
 void ui_toggle_splash(void);
 screen_t ui_get_current_screen(void);
 void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
+void ui_set_wifi_active(bool active);   // WiFi station is associated (a usable fallback link)
 void ui_update_battery(int percent, bool charging);

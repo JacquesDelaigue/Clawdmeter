@@ -1,0 +1,31 @@
+#pragma once
+//
+// Clawdmeter WiFi config — copy this file to `wifi_cfg.h` and fill in your
+// network. `wifi_cfg.h` is gitignored so your password never lands in git.
+//
+//   cp firmware/src/wifi_cfg.h.example firmware/src/wifi_cfg.h
+//
+// If `wifi_cfg.h` is absent, the firmware still builds — WiFi is compiled out
+// and the device is BLE-only, exactly as before.
+
+#define WIFI_ENABLED 1                 // 0 to build BLE-only even with this file present
+
+#define WIFI_SSID    "YOUR_WIFI_SSID"
+#define WIFI_PASS    "YOUR_WIFI_PASSWORD"
+
+// Optional shared secret. If non-empty it must match the daemon's
+// CLAWDMETER_TOKEN environment variable; the daemon then rejects /usage
+// requests without it. Leave "" for an open endpoint on a trusted home LAN.
+#define WIFI_TOKEN   ""
+
+// The daemon's LAN address is normally learned automatically over BLE and
+// cached in NVS, so leave this empty. Set it only if you want a working WiFi
+// pull on a brand-new device that has never been in BLE range yet — e.g.
+// "192.168.1.50" or your Mac's Bonjour name "Jacques-MacBook.local".
+#define WIFI_HOST_FALLBACK ""
+#define WIFI_HOST_PORT     47800       // must match HTTP_PORT in the daemon
+
+// Tuning (sensible defaults; rarely need changing)
+#define WIFI_POLL_MS     5000          // pull cadence once WiFi is the active source
+#define WIFI_TAKEOVER_MS 20000         // only use WiFi after BLE has been silent this long
+#define WIFI_RETRY_MS    15000         // re-attempt association this often while disconnected

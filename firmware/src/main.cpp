@@ -7,6 +7,7 @@
 #include "data.h"
 #include "ui.h"
 #include "ble.h"
+#include "wifi_transport.h"
 #include "splash.h"
 #include "usage_rate.h"
 #include "idle.h"
@@ -113,6 +114,9 @@ static bool parse_json(const char* json, UsageData* out, ActivityData* act) {
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->ok = doc["ok"] | false;
     out->working = doc["working"] | false;
+    // Daemon LAN address for the WiFi fallback path (present on BLE payloads).
+    strlcpy(out->host, doc["host"] | "", sizeof(out->host));
+    out->port = doc["port"] | 0;
     out->valid = true;
 
     // Optional per-session activity list (Activity screen). Absent → empty.
@@ -248,6 +252,7 @@ void setup() {
     lv_indev_set_scroll_limit(indev, 40);
 
     ble_init();
+    wifi_init();
     input_hal_init();
 
     ui_init();
@@ -307,12 +312,35 @@ static void pair_tick(void) {
     }
 }
 
+// Apply a freshly-parsed payload (in the file-scope `usage`/`activity`) to the
+// UI. Shared by the BLE and WiFi receive paths so both render identically.
+static void apply_usage(void) {
+    int g_before = usage_rate_group();
+    usage_rate_sample(usage.session_pct);
+    int g_after = usage_rate_group();
+    if (g_after != g_before) {
+        Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+            g_before, g_after, usage.session_pct);
+        if (splash_is_active()) splash_pick_for_current_rate();
+    }
+    ui_update(&usage);
+    ui_update_activity(&activity);
+
+    static bool last_working = false;
+    if (usage.working != last_working) {
+        last_working = usage.working;
+        splash_set_working(usage.working);
+        ui_set_working(usage.working);
+    }
+}
+
 void loop() {
     if (splash_get_working()) idle_note_activity();  // keep the panel awake while Claude works
     idle_tick();
     lv_timer_handler();
     ui_tick_anim();
     ble_tick();
+    wifi_tick();
     power_hal_tick();
     imu_hal_tick();
     splash_tick();
@@ -391,29 +419,24 @@ void loop() {
 
     check_serial_cmd();
 
+    // Reflect the WiFi link in the UI so a fresh WiFi feed shows the usage
+    // panel (not the "pair me" hint) when BLE is out of range.
+    ui_set_wifi_active(wifi_link_up());
+
     if (ble_has_data()) {
+        // BLE is the primary link.
         if (parse_json(ble_get_data(), &usage, &activity)) {
-            int g_before = usage_rate_group();
-            usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
-            ui_update_activity(&activity);
-
-            static bool last_working = false;
-            if (usage.working != last_working) {
-                last_working = usage.working;
-                splash_set_working(usage.working);
-                ui_set_working(usage.working);
-            }
-
+            apply_usage();
+            wifi_note_ble_data();                       // reset the WiFi-takeover timer
+            wifi_note_ble_host(usage.host, usage.port); // learn/cache the daemon's LAN address
             ble_send_ack();
         } else {
             ble_send_nack();
+        }
+    } else if (wifi_has_data()) {
+        // Fallback: a payload pulled over WiFi while BLE is stale/out of range.
+        if (parse_json(wifi_get_data(), &usage, &activity)) {
+            apply_usage();
         }
     }
 

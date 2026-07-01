@@ -193,6 +193,29 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
 7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
 
+## WiFi fallback (out of Bluetooth range)
+
+By default the device is BLE-only. You can optionally enable a **WiFi fallback** so the usage screen keeps updating when you carry the device out of Bluetooth range but stay on the same network as the host.
+
+How it works: the daemon also serves the *same* JSON payload over a tiny LAN HTTP endpoint (`GET /usage`, default port `47800`), and stamps its own LAN IP + port into the BLE payload. The firmware caches that address (in NVS) while it's in BLE range, so it learns where to pull from with no hardcoded IP — surviving DHCP changes. **BLE stays primary**; the device only pulls over WiFi once BLE data has gone stale (default 20 s), and switches straight back to BLE when it's back in range.
+
+Two constraints to know:
+- The **host (Mac/PC) must be on and awake** — it's still the data source; WiFi only changes the transport.
+- The **side buttons stay on BLE HID**, so out of BLE range the buttons don't work even though the screen keeps updating.
+
+**Enable it:**
+
+1. Copy the config template and fill in your network (the real file is gitignored, so your password never lands in git):
+   ```bash
+   cp firmware/src/wifi_cfg.h.example firmware/src/wifi_cfg.h
+   # edit firmware/src/wifi_cfg.h → set WIFI_SSID and WIFI_PASS
+   ```
+   If `wifi_cfg.h` is absent, the firmware builds BLE-only exactly as before.
+2. Reflash the firmware (see the flashing steps above for your OS).
+3. The daemon serves `/usage` automatically — no extra setup. Verify with `curl http://<host-lan-ip>:47800/usage`.
+
+**Optional auth:** for a shared secret, set `WIFI_TOKEN` in `wifi_cfg.h` to a matching value and run the daemon with `CLAWDMETER_TOKEN=<same value>` in its environment (add it to the LaunchAgent's `EnvironmentVariables` on macOS). The endpoint then rejects requests without `?token=`. Leave both empty for an open endpoint on a trusted LAN. The port is configurable via `CLAWDMETER_PORT` (daemon) / `WIFI_HOST_PORT` (firmware) — keep them equal.
+
 ## Physical buttons
 
 The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.

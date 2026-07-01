@@ -2,6 +2,9 @@
 firmware/.pio/
 firmware/.vscode/
 
+# Local WiFi credentials (copied from wifi_cfg.h.example)
+firmware/src/wifi_cfg.h
+
 # OS
 .DS_Store
 

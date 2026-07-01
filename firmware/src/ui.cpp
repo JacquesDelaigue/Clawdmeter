@@ -185,7 +185,15 @@ static int selected_session = -1;            // which row opened the detail scre
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
 static bool     s_ble_connected = false;   // cached BLE connection state
+static bool     s_wifi_active = false;      // WiFi station associated (a usable fallback link)
 static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("Connected" dwell)
+
+// A host link exists if either transport is up. Used by the view-state and the
+// animated status line so a WiFi-only device (out of BLE range) still shows
+// usage/idle instead of the "pair me" hint.
+static inline bool link_up(void) { return s_ble_connected || s_wifi_active; }
+
+void ui_set_wifi_active(bool active) { s_wifi_active = active; }
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -903,7 +911,7 @@ void ui_update_activity(const ActivityData* data) {
 static void update_view_state(void) {
     if (!usage_group || !pair_group || !idle_group) return;
     int v;
-    if (!s_ble_connected) {
+    if (!link_up()) {
         v = 0;  // pairing hint
     } else if (data_received && (lv_tick_get() - last_data_ms) < DATA_FRESH_MS) {
         v = 2;  // live usage
@@ -940,7 +948,7 @@ void ui_tick_anim(void) {
 
     // Status text by priority. Whimsical messages only when connected & settled.
     const char* text;
-    if (!s_ble_connected) {
+    if (!link_up()) {
         text = "Waiting";              // advertising / waiting for a host connection
     } else if (view_state == 1) {      // idle — alternate so it reads as alive AND data-less
         text = (anim_msg_idx & 1) ? "No data" : "Listening";
