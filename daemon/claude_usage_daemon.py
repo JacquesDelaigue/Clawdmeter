@@ -42,6 +42,9 @@ SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-addres
 STATE_FILE = Path.home() / ".clawdmeter" / "state.json"  # written by clawdmeter_hook.py
 WORKING_STALE_SECONDS = 120  # ignore a session's phase=="running" older than this (missed-Stop guard)
 SESSION_LIST_SECONDS = 15 * 60  # keep idle sessions in the Activity list this long (matches the hook's TTL) so idle-time stays meaningful
+FAIL_WINDOW_SECONDS = 600    # a StopFailure counts toward the "fc" attention aggregate for this long (10 min)
+IDLE_WINDOW_SECONDS = 900    # a finished-turn ("your turn") session counts toward "it" for this long (15 min)
+ATTENTION_PENDING_TTL_SECONDS = 2 * 60 * 60  # mirrors the hook's PENDING_TTL_SECONDS — a blocked session stays attention-eligible this long, past the normal SESSION_LIST_SECONDS cutoff
 MAX_SESSIONS = 5             # cap the Activity-screen list sent over BLE
 MAX_BLE_PAYLOAD = 480        # keep under NimBLE's 512-byte attribute cap
 # Auto-recovery: if no successful BLE write lands for this long, exit non-zero so
@@ -165,7 +168,9 @@ def read_working() -> bool:
 
     Reads ~/.clawdmeter/state.json written by clawdmeter_hook.py. The staleness
     guard means a missed Stop hook (e.g. a crash) clears 'working' within
-    WORKING_STALE_SECONDS rather than sticking on forever.
+    WORKING_STALE_SECONDS rather than sticking on forever. A session that's
+    BLOCKED on the user (non-empty 'pending') doesn't count as working — that's
+    read_attention()'s job, not the splash verb-ticker's.
     """
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -173,9 +178,72 @@ def read_working() -> bool:
         return False
     now = time.time()
     for s in state.get("sessions", {}).values():
-        if s.get("phase") == "running" and (now - s.get("last_active_ts", 0)) < WORKING_STALE_SECONDS:
+        if (
+            s.get("phase") == "running"
+            and (now - s.get("last_active_ts", 0)) < WORKING_STALE_SECONDS
+            and not s.get("pending")
+        ):
             return True
     return False
+
+
+def _sanitize_ascii(text: str) -> str:
+    """Keep only printable ASCII (0x20-0x7E) and collapse whitespace runs — the
+    device font can't render anything else."""
+    cleaned = "".join(c if " " <= c <= "~" else " " for c in text)
+    return " ".join(cleaned.split())
+
+
+def read_attention() -> dict:
+    """Aggregate cross-session attention signals from state.json into the wire
+    counters bc/ba/bp/it/fc. AGGREGATE ONLY — no session_id, tool name, or other
+    per-session detail leaves this function (the per-session Activity screen
+    was removed on purpose; see the module docstring).
+
+    A session counts at all only if it's fresh (< SESSION_LIST_SECONDS), except
+    a blocked session (non-empty 'pending'), which stays eligible for up to
+    ATTENTION_PENDING_TTL_SECONDS — mirroring the hook's own _prune() so a
+    pending decision doesn't drop off the beacon while you're away.
+    """
+    try:
+        state = json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"bc": 0, "ba": 0, "bp": "", "it": 0, "fc": 0}
+
+    now = time.time()
+    bc = it = fc = 0
+    oldest_block_ts: float | None = None
+    oldest_block_project = ""
+
+    for s in state.get("sessions", {}).values():
+        pending = s.get("pending") or {}
+        blocked = bool(pending)
+        ttl = ATTENTION_PENDING_TTL_SECONDS if blocked else SESSION_LIST_SECONDS
+        if (now - s.get("last_active_ts", 0)) >= ttl:
+            continue
+
+        failed = bool(s.get("failed_ts")) and (now - s["failed_ts"]) < FAIL_WINDOW_SECONDS
+        idle_wait = (
+            bool(s.get("idle_ts"))
+            and (now - s["idle_ts"]) < IDLE_WINDOW_SECONDS
+            and not blocked
+            and not failed
+        )
+
+        if blocked:
+            bc += 1
+            block_ts = min(v.get("ts", now) for v in pending.values())
+            if oldest_block_ts is None or block_ts < oldest_block_ts:
+                oldest_block_ts = block_ts
+                oldest_block_project = s.get("project", "")
+        if idle_wait:
+            it += 1
+        if failed:
+            fc += 1
+
+    ba = int(now - oldest_block_ts) if oldest_block_ts is not None else 0
+    bp = _sanitize_ascii(oldest_block_project)[:16] if bc else ""
+    return {"bc": bc, "ba": ba, "bp": bp, "it": it, "fc": fc}
 
 
 def load_cached_address() -> str | None:
@@ -480,6 +548,29 @@ async def _wait_any(events, timeout: float) -> None:
             t.cancel()
 
 
+def notify_mac(title: str, text: str) -> None:
+    """Best-effort macOS notification banner (with sound) — the device has no
+    speaker of its own, so a lingering blocked session gets escalated here.
+    Fire-and-forget: launched via Popen (non-blocking) and any failure is
+    swallowed so a broken/missing osascript can never stall the poller."""
+
+    def _esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    script = (
+        f'display notification "{_esc(text)}" with title "{_esc(title)}" '
+        f'sound name "Submarine"'
+    )
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 async def poller(stop_event: asyncio.Event) -> None:
     """Poll the API + read the hook's state.json on a cadence, assemble the
     payload, and publish it to _latest_payload for BOTH transports.
@@ -495,6 +586,8 @@ async def poller(stop_event: asyncio.Event) -> None:
     api_payload: dict | None = None
     last_state_mtime = state_mtime()
     pushed_working: bool | None = None
+    pushed_attention: dict | None = None
+    block_notified = False  # have we already escalated for the CURRENT block episode?
     while not stop_event.is_set():
         now = time.time()
         forced = _force_poll is not None and _force_poll.is_set()
@@ -516,20 +609,41 @@ async def poller(stop_event: asyncio.Event) -> None:
             state_changed = mt != last_state_mtime
             last_state_mtime = mt
             working = read_working()
-            # Usage-only payload (Activity/Approval screens were removed). Stamp
-            # our LAN address so the device can still pull over WiFi when BLE is
-            # stale.
+            attention = read_attention()
+            # Usage-only payload (Activity/Approval screens were removed) plus
+            # the 5 aggregate attention counters (bc/ba/bp/it/fc). Stamp our LAN
+            # address so the device can still pull over WiFi when BLE is stale.
             payload = {k: v for k, v in api_payload.items() if k != "sessions"}
             payload["working"] = working
+            payload.update(attention)
             payload["host"] = lan_ip()
             payload["port"] = HTTP_PORT
             with _latest_lock:
                 _latest_payload = payload
-            push = do_poll or (state_changed and working != pushed_working)
+            # Level-triggered (full state every push); also push the moment
+            # attention itself changes (not just on poll/working-flip) so the
+            # beacon reacts within a TICK (~5s) instead of waiting for the
+            # 60s poll — e.g. "ba" (block age) ticks up every cycle while
+            # bc>0, which is exactly the responsiveness we want here.
+            push = (
+                do_poll
+                or (state_changed and working != pushed_working)
+                or attention != pushed_attention
+            )
             if push:
                 pushed_working = working
+                pushed_attention = attention
                 if _payload_updated is not None:
                     _payload_updated.set()
+
+            # Mac-side escalation: the device has no speaker, so nudge Jacques
+            # once per block episode after it's lingered past 2 minutes.
+            if attention["bc"] > 0:
+                if attention["ba"] >= 120 and not block_notified:
+                    notify_mac("Clawdmeter", f"{attention['bc']} session(s) waiting on you")
+                    block_notified = True
+            else:
+                block_notified = False
 
         await _wait_any([stop_event, _force_poll], TICK)
 
