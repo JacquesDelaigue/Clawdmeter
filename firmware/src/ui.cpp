@@ -158,7 +158,6 @@ static lv_obj_t* lbl_alert_num;     // big "!" (RED) or capped block count (AMBE
 static lv_obj_t* lbl_alert_title;   // "SESSION FAILED" / "N FAILED" / "YOUR TURN"
 static lv_obj_t* lbl_alert_sub;     // "> <project>" (AMBER only, may be blank)
 static lv_obj_t* lbl_alert_stale;   // small "link lost" mark inside the takeover
-static lv_obj_t* lbl_turn_chip;     // small blue "your turn -N" overlay (BLUE only)
 static lv_obj_t* lbl_link_stale;    // small gray "link lost" overlay (outside the takeover)
 
 enum attn_severity_t { ATTN_CALM, ATTN_BLUE, ATTN_AMBER, ATTN_RED };
@@ -177,7 +176,6 @@ static screen_t remembered_ring_screen = SCREEN_USAGE; // ring screen to return 
 static attn_severity_t compute_severity(void) {
     if (s_failed_count  > 0) return ATTN_RED;
     if (s_blocked_count > 0) return ATTN_AMBER;
-    if (s_idle_turn     > 0) return ATTN_BLUE;
     return ATTN_CALM;
 }
 
@@ -517,20 +515,6 @@ static void build_alert_screen(lv_obj_t* parent) {
 // overlays that ride on top of splash/usage, as opposed to the full-bleed
 // takeover above. Created last (topmost z-order) so they sit over both.
 static void build_attention_overlays(lv_obj_t* parent) {
-    lbl_turn_chip = lv_label_create(parent);
-    lv_label_set_text(lbl_turn_chip, "");
-    lv_obj_set_style_text_font(lbl_turn_chip, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_turn_chip, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl_turn_chip, COL_BLUE, 0);
-    lv_obj_set_style_bg_opa(lbl_turn_chip, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl_turn_chip, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl_turn_chip, 14, 0);
-    lv_obj_set_style_pad_right(lbl_turn_chip, 14, 0);
-    lv_obj_set_style_pad_top(lbl_turn_chip, 5, 0);
-    lv_obj_set_style_pad_bottom(lbl_turn_chip, 5, 0);
-    lv_obj_align(lbl_turn_chip, LV_ALIGN_BOTTOM_RIGHT, -L.margin, -12);
-    lv_obj_add_flag(lbl_turn_chip, LV_OBJ_FLAG_HIDDEN);
-
     lbl_link_stale = lv_label_create(parent);
     lv_label_set_text(lbl_link_stale, "link lost");
     lv_obj_set_style_text_font(lbl_link_stale, &font_styrene_14, 0);
@@ -845,23 +829,6 @@ void ui_attention_tick(void) {
         if (s_alert_active) {
             s_alert_active = false;
             ui_show_screen(remembered_ring_screen);
-        }
-
-        static int shown_it = -1;
-        if (lbl_turn_chip) {
-            if (sev == ATTN_BLUE) {
-                if (s_idle_turn != shown_it) {
-                    shown_it = s_idle_turn;
-                    char n[8], buf[24];
-                    format_capped_count(s_idle_turn, n, sizeof(n));
-                    snprintf(buf, sizeof(buf), "your turn -%s", n);
-                    lv_label_set_text(lbl_turn_chip, buf);
-                }
-                lv_obj_clear_flag(lbl_turn_chip, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                shown_it = -1;
-                lv_obj_add_flag(lbl_turn_chip, LV_OBJ_FLAG_HIDDEN);
-            }
         }
 
         if (lbl_link_stale) {
