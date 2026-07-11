@@ -165,7 +165,9 @@ def read_working() -> bool:
 
     Reads ~/.clawdmeter/state.json written by clawdmeter_hook.py. The staleness
     guard means a missed Stop hook (e.g. a crash) clears 'working' within
-    WORKING_STALE_SECONDS rather than sticking on forever.
+    WORKING_STALE_SECONDS rather than sticking on forever. A session blocked on
+    an approval (`pending`) is excluded — it isn't actually running, and the
+    device's verb-ticker shouldn't cycle while Claude waits on the user.
     """
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -173,19 +175,72 @@ def read_working() -> bool:
         return False
     now = time.time()
     for s in state.get("sessions", {}).values():
-        if s.get("phase") == "running" and (now - s.get("last_active_ts", 0)) < WORKING_STALE_SECONDS:
+        if (s.get("phase") == "running" and not s.get("pending")
+                and (now - s.get("last_active_ts", 0)) < WORKING_STALE_SECONDS):
             return True
     return False
 
 
-def _activity_summary(s: dict) -> str:
-    """One-line 'what is this session doing right now', e.g. 'Edit ui.cpp' or
-    'Bash npm test'. Empty when the session is idle / nothing notable."""
-    tool = (s.get("current_tool") or "").strip()
-    if not tool:
+def _sanitize(text: str) -> str:
+    """Keep only printable ASCII, collapse whitespace runs to a single space,
+    strip. Session fields (prompts, tool args, todo text) are free-form user/
+    model text and can carry newlines, control bytes, or non-ASCII — none of
+    which the device's fixed-width display can render safely."""
+    if not text:
         return ""
-    args = (s.get("current_tool_args") or "").strip()
-    return f"{tool} {args}".strip()[:38]
+    cleaned = "".join(c if " " <= c <= "~" else " " for c in text)
+    return " ".join(cleaned.split())
+
+
+def _clean_prompt(p: str) -> str:
+    """The user's last prompt, or "" if missing or if it looks like injected
+    agent XML (e.g. '<task-notification>...') rather than something the user
+    actually typed — live state.json shows last_user_prompt often isn't."""
+    if not p or p.lstrip().startswith("<"):
+        return ""
+    return _sanitize(p)
+
+
+def _latest_pending(s: dict) -> dict | None:
+    """The most recently raised pending-approval entry for a session, or None."""
+    pending = s.get("pending")
+    if not isinstance(pending, dict) or not pending:
+        return None
+    return max(pending.values(), key=lambda p: p.get("ts", 0) if isinstance(p, dict) else 0)
+
+
+def _activity_summary(s: dict, state: str) -> str:
+    """One-line 'what this session is doing / just did', tailored to its
+    derived device state — the row label on the Activity screen.
+
+    needs_input: the most recent pending approval's ask. failed: the error
+    type. working: the in-progress todo, else the current tool. completed:
+    the last tool that ran, else the user's last prompt (if it isn't injected
+    XML), else the session title, else "Idle"."""
+    if state == "needs_input":
+        ask = (_latest_pending(s) or {}).get("ask", "")
+        text = f"Waiting: {ask}" if ask else "Waiting"
+    elif state == "failed":
+        err = (s.get("error_type") or "").strip()
+        text = f"Failed: {err}" if err else "Failed"
+    elif state == "working":
+        _, _, todo_now = _todo_progress(s)
+        if todo_now:
+            text = todo_now
+        else:
+            tool = (s.get("current_tool") or "").strip()
+            args = (s.get("current_tool_args") or "").strip()
+            text = f"{tool} {args}".strip() if tool else "Working"
+    else:  # completed
+        last_tool = (s.get("last_tool_name") or "").strip()
+        if last_tool:
+            args = (s.get("last_tool_args") or "").strip()
+            text = f"{last_tool} {args}".strip()
+        else:
+            text = (_clean_prompt(s.get("last_user_prompt") or "")
+                     or (s.get("session_title") or "").strip()
+                     or "Idle")
+    return _sanitize(text)[:32]  # fits the firmware summary[36] field + 5-session BLE budget
 
 
 def _todo_progress(s: dict):
@@ -202,18 +257,26 @@ def _todo_progress(s: dict):
     return done, len(todos), now_txt
 
 
+# 1-char device state codes (wire contract v2.0). Priority when several
+# conditions hold at once: pending approval > running > failed > completed.
+_STATE_CODE = {"needs_input": "n", "working": "w", "completed": "c", "failed": "f"}
+
+
 def read_sessions() -> list:
     """Per-session activity list for the device's Activity screen.
 
     Reads ~/.clawdmeter/state.json, keeps sessions seen within
     SESSION_LIST_SECONDS (so idle sessions stay listed long enough for their
-    idle-time to be meaningful), sorts most-recently-active first, caps at
-    MAX_SESSIONS, and emits short keys to keep the BLE payload small.
+    idle-time to be meaningful), derives each session's 1-char state, sorts
+    urgent sessions (needs_input/failed) first and most-recently-active
+    otherwise, caps at MAX_SESSIONS, and emits short keys to keep the BLE
+    payload small.
 
-    Always-present (lightweight, fits any payload): p=project, m=model,
-    c=context-%, w=running flag, i=idle seconds. Detail fields, added by the
-    caller's budget pass only when they fit: a=activity, td/tt=todo done/total,
-    tn=in-progress todo.
+    LEAN tier (always sent, both transports): id=first 4 chars of the session
+    id, ss=1-char state code, i=idle seconds. RICH/detail tier (HTTP always;
+    BLE only if it fits, stripped oldest-first by fit_sessions): a=state-aware
+    activity summary, ak=approval ask (needs_input sessions only), e=effort,
+    c=context-%, td/tt=todo done/total, tn=in-progress todo, p=project.
     """
     try:
         state = json.loads(STATE_FILE.read_text())
@@ -223,37 +286,58 @@ def read_sessions() -> list:
     if not isinstance(sessions, dict):
         return []
     now = time.time()
-    fresh = [s for s in sessions.values()
+    fresh = [(sid, s) for sid, s in sessions.items()
              if isinstance(s, dict) and (now - s.get("last_active_ts", 0)) < SESSION_LIST_SECONDS]
-    fresh.sort(key=lambda s: s.get("last_active_ts", 0), reverse=True)
-    out = []
-    for s in fresh[:MAX_SESSIONS]:
-        idle = int(max(0, now - s.get("last_active_ts", 0)))
+
+    rows = []
+    for sid, s in fresh:
+        last_active_ts = s.get("last_active_ts", 0)
+        idle = int(max(0, now - last_active_ts))
         # A session whose phase is "running" but which hasn't moved in
         # WORKING_STALE_SECONDS (missed Stop) reads as idle, not stuck-running.
         running = s.get("phase") == "running" and idle < WORKING_STALE_SECONDS
+        if s.get("pending"):
+            state_name = "needs_input"
+        elif running:
+            state_name = "working"
+        elif s.get("outcome") == "failed":
+            state_name = "failed"
+        else:
+            state_name = "completed"
+        rows.append((sid, s, state_name, idle, last_active_ts))
+
+    # Urgent first so fit_sessions, which trims from the tail, never sacrifices
+    # an urgent session to the MAX_SESSIONS cap.
+    rows.sort(key=lambda r: (0 if r[2] in ("needs_input", "failed") else 1, -r[4]))
+
+    out = []
+    for sid, s, state_name, idle, _last_active_ts in rows[:MAX_SESSIONS]:
         done, total, todo_now = _todo_progress(s)
-        out.append({
-            "p": (s.get("project") or "")[:23],
-            "m": (s.get("model") or "")[:15],
+        entry = {
+            "id": sid[:4] if sid else "?",
+            "ss": _STATE_CODE[state_name],
+            "i": idle,
+            "a": _activity_summary(s, state_name),
             "e": (s.get("effort") or "")[:7],
             "c": int(s.get("ctx_pct", 0) or 0),
-            "w": 1 if running else 0,
-            "i": idle,
-            # detail fields (the byte-budget pass strips these from older
-            # sessions if the payload would overflow):
-            "a": _activity_summary(s) if running else "Idle",
             "td": done,
             "tt": total,
             "tn": todo_now,
-        })
+            "p": (s.get("project") or "")[:23],
+        }
+        if state_name == "needs_input":
+            entry["ak"] = _sanitize((_latest_pending(s) or {}).get("ask", ""))[:46]
+        out.append(entry)
     return out
 
 
 # Keys that make up the lightweight, always-sent part of a session entry.
-_SESSION_LIST_KEYS = ("p", "m", "e", "c", "w", "i")
+# `a` (the short activity summary / row label) rides in the always-sent lean
+# tier so every Activity row is labelled even over BLE — the device's WiFi feed
+# is a stale-BLE fallback (20s takeover), so BLE stays the primary render path.
+_SESSION_LIST_KEYS = ("id", "ss", "i", "a")
 # Detail keys, dropped oldest-first when the payload would exceed MAX_BLE_PAYLOAD.
-_SESSION_DETAIL_KEYS = ("a", "td", "tt", "tn")
+_SESSION_DETAIL_KEYS = ("ak", "e", "c", "td", "tt", "tn", "p")
 
 
 def fit_sessions(base_payload: dict, sessions: list) -> list:
@@ -328,12 +412,18 @@ async def scan_for_device() -> str | None:
 _cb_manager = None  # reused CentralManagerDelegate (CoreBluetooth)
 _last_success_ts = 0.0  # time.time() of the last successful BLE write (for the watchdog)
 
-# Shared latest payload — produced by the poller task, consumed by BOTH the BLE
-# sender and the HTTP server. Guarded by a plain threading.Lock because the HTTP
-# handler runs in its own thread; the asyncio side only holds it briefly (never
-# across an await). The two asyncio.Events are created in main() once a loop is
-# running.
+# Shared latest payload(s) — produced by the poller task, consumed by BOTH the
+# BLE sender and the HTTP server. Guarded by a plain threading.Lock because the
+# HTTP handler runs in its own thread; the asyncio side only holds it briefly
+# (never across an await). The two asyncio.Events are created in main() once a
+# loop is running.
+#
+# Two tiers: _latest_payload is the lean, MAX_BLE_PAYLOAD-capped session list
+# (what BLE sends); _latest_rich_payload carries the FULL, uncapped session
+# list for the WiFi/HTTP consumer, which isn't bound by the BLE attribute cap
+# and prefers the richer feed when it's on the local network.
 _latest_payload: dict | None = None
+_latest_rich_payload: dict | None = None
 _latest_lock = threading.Lock()
 _payload_updated: asyncio.Event | None = None  # poller → BLE sender: a push-worthy change landed
 _force_poll: asyncio.Event | None = None        # BLE sender → poller: device asked for a refresh
@@ -522,7 +612,9 @@ class _UsageHandler(BaseHTTPRequestHandler):
             self._send(403)
             return
         with _latest_lock:
-            payload = _latest_payload
+            # Prefer the uncapped rich feed (WiFi isn't byte-limited like BLE);
+            # fall back to the lean payload if a rich one hasn't landed yet.
+            payload = _latest_rich_payload or _latest_payload
         if payload is None:
             self._send(503)  # nothing polled yet
             return
@@ -586,15 +678,16 @@ async def _wait_any(events, timeout: float) -> None:
 
 async def poller(stop_event: asyncio.Event) -> None:
     """Poll the API + read the hook's state.json on a cadence, assemble the
-    payload, and publish it to _latest_payload for BOTH transports.
+    lean (BLE-capped) and rich (uncapped) payloads, and publish them to
+    _latest_payload / _latest_rich_payload respectively.
 
     Runs independently of any BLE connection — that's what makes the WiFi
-    endpoint work when the device is out of Bluetooth range. The shared payload
-    is refreshed every cycle (so HTTP stays current), but the BLE sender is only
+    endpoint work when the device is out of Bluetooth range. Both payloads are
+    refreshed every cycle (so HTTP stays current), but the BLE sender is only
     nudged (via _payload_updated) on a push-worthy change, preserving the
     original poll-or-state-change push policy and BLE write frequency.
     """
-    global _latest_payload
+    global _latest_payload, _latest_rich_payload
     last_poll = 0.0
     api_payload: dict | None = None
     last_state_mtime = state_mtime()
@@ -627,18 +720,24 @@ async def poller(stop_event: asyncio.Event) -> None:
             base["working"] = working
             base["host"] = lan_ip()
             base["port"] = HTTP_PORT
-            # Keep the payload under the BLE attribute cap (host/port included in
-            # the budget); the HTTP path serves the same capped payload.
-            sessions = fit_sessions(base, sessions)
-            payload = dict(base)
-            payload["sessions"] = sessions
+            # Rich tier: the full session list, uncapped, for HTTP/WiFi.
+            rich_payload = dict(base)
+            rich_payload["sessions"] = sessions
+            # Lean tier: keep the payload under the BLE attribute cap
+            # (host/port included in the budget).
+            lean_sessions = fit_sessions(base, sessions)
+            lean_payload = dict(base)
+            lean_payload["sessions"] = lean_sessions
             with _latest_lock:
-                _latest_payload = payload
+                _latest_payload = lean_payload
+                _latest_rich_payload = rich_payload
+            # Push-worthy change is judged on the lean (BLE) session list —
+            # unchanged BLE write frequency/policy.
             push = do_poll or (state_changed and (
-                working != pushed_working or sessions != pushed_sessions))
+                working != pushed_working or lean_sessions != pushed_sessions))
             if push:
                 pushed_working = working
-                pushed_sessions = sessions
+                pushed_sessions = lean_sessions
                 if _payload_updated is not None:
                     _payload_updated.set()
 
