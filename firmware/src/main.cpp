@@ -22,7 +22,6 @@
 #include "hal/imu_hal.h"
 
 static UsageData usage = {};
-static ActivityData activity = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -99,7 +98,7 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 }
 
 // Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out, ActivityData* act) {
+static bool parse_json(const char* json, UsageData* out) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, json);
     if (err) {
@@ -118,66 +117,13 @@ static bool parse_json(const char* json, UsageData* out, ActivityData* act) {
     strlcpy(out->host, doc["host"] | "", sizeof(out->host));
     out->port = doc["port"] | 0;
     out->valid = true;
-
-    // Optional per-session activity list (Activity screen). Absent → empty.
-    act->count = 0;
-    JsonArray sessions = doc["sessions"].as<JsonArray>();
-    if (!sessions.isNull()) {
-        for (JsonObject s : sessions) {
-            if (act->count >= MAX_SESSIONS) break;
-            SessionData& sd = act->sessions[act->count];
-            strlcpy(sd.project, s["p"] | "", sizeof(sd.project));
-            strlcpy(sd.model,   s["m"] | "", sizeof(sd.model));
-            strlcpy(sd.effort,  s["e"] | "", sizeof(sd.effort));
-            sd.ctx_pct = s["c"] | 0;
-            sd.working = ((int)(s["w"] | 0)) != 0;
-            sd.idle_secs = s["i"] | 0;
-            strlcpy(sd.id, s["id"] | "", sizeof(sd.id));
-
-            // State: prefer the explicit "ss" tag; the daemon may not have
-            // rolled it out yet, so fall back to "w" (running -> working,
-            // else completed) when the key is absent entirely.
-            if (s["ss"].is<const char*>()) {
-                const char* ss = s["ss"] | "w";
-                if      (!strcmp(ss, "n")) sd.state = SESSION_NEEDS_INPUT;
-                else if (!strcmp(ss, "c")) sd.state = SESSION_COMPLETED;
-                else if (!strcmp(ss, "f")) sd.state = SESSION_FAILED;
-                else                       sd.state = SESSION_WORKING;  // "w" or unrecognized
-            } else {
-                sd.state = sd.working ? SESSION_WORKING : SESSION_COMPLETED;
-            }
-
-            // Row-label summary: "a" (headline) -> project -> generic fallback.
-            const char* a_val = s["a"] | "";
-            if (a_val[0])            strlcpy(sd.summary, a_val, sizeof(sd.summary));
-            else if (sd.project[0])  strlcpy(sd.summary, sd.project, sizeof(sd.summary));
-            else                     strlcpy(sd.summary, "(session)", sizeof(sd.summary));
-
-            strlcpy(sd.approval_ask, s["ak"] | "", sizeof(sd.approval_ask));
-
-            // Detail fields are best-effort: the daemon drops them (key "a"
-            // absent) for older sessions when the BLE payload would overflow.
-            sd.has_detail = s["a"].is<const char*>();
-            strlcpy(sd.activity, s["a"] | "", sizeof(sd.activity));
-            sd.todo_done  = s["td"] | 0;
-            sd.todo_total = s["tt"] | 0;
-            strlcpy(sd.todo_now, s["tn"] | "", sizeof(sd.todo_now));
-            act->count++;
-        }
-    }
-    act->valid = true;
     return true;
 }
 
 // ---- Serial command buffer ----
-// Sized to match the BLE/WiFi JSON buffers (BLE_BUF_SIZE / g_buf) so an
-// "inject <json>" QA fixture can carry a full activity payload, not just a
-// short command word.
-#define CMD_BUF_SIZE 1024
+#define CMD_BUF_SIZE 64
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
-
-static void apply_usage(void);  // defined below; used by the serial "inject" command
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
@@ -222,24 +168,7 @@ static void check_serial_cmd() {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
-            if (strcmp(cmd_buf, "screenshot") == 0) {
-                send_screenshot();
-            } else if (strncmp(cmd_buf, "inject ", 7) == 0) {
-                // QA fixture injection: feed a deterministic payload without
-                // a daemon, through the exact same parse/apply path as BLE/WiFi.
-                if (parse_json(cmd_buf + 7, &usage, &activity)) {
-                    apply_usage();
-                    Serial.println("INJECTED");
-                }
-            } else if (strncmp(cmd_buf, "screen ", 7) == 0) {
-                // QA: force a screen so screenshots can target Activity/Approval
-                // without a touch tap. n = screen_t index (2=Activity, 3=Approval).
-                int n = atoi(cmd_buf + 7);
-                if (n >= 0 && n < SCREEN_COUNT) {
-                    ui_show_screen((screen_t)n);
-                    Serial.println("SCREEN_SET");
-                }
-            }
+            if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -357,12 +286,10 @@ static void pair_tick(void) {
     }
 }
 
-// Apply a freshly-parsed payload (in the file-scope `usage`/`activity`) to the
-// UI. Shared by the BLE and WiFi receive paths so both render identically.
+// Apply a freshly-parsed payload (in the file-scope `usage`) to the UI.
+// Shared by the BLE and WiFi receive paths so both render identically.
 static void apply_usage(void) {
     ui_update(&usage);
-    ui_update_activity(&activity);
-    ui_update_approval(&activity);
 
     static bool last_working = false;
     if (usage.working != last_working) {
@@ -461,30 +388,20 @@ void loop() {
     // panel (not the "pair me" hint) when BLE is out of range.
     ui_set_wifi_active(wifi_link_up());
 
-    // WiFi carries the richer feed (LAN, no BLE payload cap), so prefer it for
-    // rendering once the link is up. BLE is still parsed every loop so its
-    // ack/nack keeps flowing and the daemon's host/port stay learnable even
-    // while WiFi is doing the rendering.
-    bool rendered = false;
-    if (wifi_link_up() && wifi_has_data()) {
-        if (parse_json(wifi_get_data(), &usage, &activity)) {
-            apply_usage();
-            rendered = true;
-        }
-    }
     if (ble_has_data()) {
-        UsageData btmp; ActivityData atmp;
-        if (parse_json(ble_get_data(), &btmp, &atmp)) {
+        // BLE is the primary link.
+        if (parse_json(ble_get_data(), &usage)) {
+            apply_usage();
             wifi_note_ble_data();                       // reset the WiFi-takeover timer
-            wifi_note_ble_host(btmp.host, btmp.port);   // learn/cache the daemon's LAN address
+            wifi_note_ble_host(usage.host, usage.port); // learn/cache the daemon's LAN address
             ble_send_ack();
-            if (!rendered) {
-                usage = btmp;
-                activity = atmp;
-                apply_usage();
-            }
         } else {
             ble_send_nack();
+        }
+    } else if (wifi_has_data()) {
+        // Fallback: a payload pulled over WiFi while BLE is stale/out of range.
+        if (parse_json(wifi_get_data(), &usage)) {
+            apply_usage();
         }
     }
 
