@@ -94,6 +94,7 @@ static void compute_layout(const BoardCaps& c) {
 #define COL_GREEN     THEME_GREEN
 #define COL_AMBER     THEME_AMBER
 #define COL_RED       THEME_RED
+#define COL_BLUE      THEME_BLUE
 #define COL_BAR_BG    THEME_BAR_BG
 
 // ---- Usage screen widgets (single non-splash view) ----
@@ -146,6 +147,55 @@ static uint32_t connected_at_ms = 0;       // when we last entered CONNECTED ("C
 static inline bool link_up(void) { return s_ble_connected || s_wifi_active; }
 
 void ui_set_wifi_active(bool active) { s_wifi_active = active; }
+
+// ---- Attention overlay (severity ladder: RED > AMBER > BLUE > calm) ----
+// alert_container is a full-bleed takeover screen for RED/AMBER; the chip and
+// stale glyphs below ride as small overlays on top of whichever ring screen
+// (splash/usage) is showing for BLUE/calm. Cached fields come from the
+// daemon via ui_set_attention(); the manager itself lives in ui_attention_tick().
+static lv_obj_t* alert_container;
+static lv_obj_t* lbl_alert_num;     // big "!" (RED) or capped block count (AMBER)
+static lv_obj_t* lbl_alert_title;   // "SESSION FAILED" / "N FAILED" / "YOUR TURN"
+static lv_obj_t* lbl_alert_sub;     // "> <project>" (AMBER only, may be blank)
+static lv_obj_t* lbl_alert_stale;   // small "link lost" mark inside the takeover
+static lv_obj_t* lbl_turn_chip;     // small blue "your turn -N" overlay (BLUE only)
+static lv_obj_t* lbl_link_stale;    // small gray "link lost" overlay (outside the takeover)
+
+enum attn_severity_t { ATTN_CALM, ATTN_BLUE, ATTN_AMBER, ATTN_RED };
+
+static int      s_blocked_count = 0;
+static int      s_blocked_age   = 0;
+static char     s_block_project[20] = "";
+static int      s_idle_turn     = 0;
+static int      s_failed_count  = 0;
+static bool     s_link_stale    = false;
+static bool     s_alert_active  = false;             // currently forcing SCREEN_ALERT
+static screen_t remembered_ring_screen = SCREEN_USAGE; // ring screen to return to on clear
+
+// Precedence, highest wins: a crashed session (RED) outranks being blocked
+// (AMBER), which outranks a plain "your turn" (BLUE).
+static attn_severity_t compute_severity(void) {
+    if (s_failed_count  > 0) return ATTN_RED;
+    if (s_blocked_count > 0) return ATTN_AMBER;
+    if (s_idle_turn     > 0) return ATTN_BLUE;
+    return ATTN_CALM;
+}
+
+// Cheap triangle-wave "breathing" brightness: oscillates a bg_opa value
+// between lo and hi over period_ms. No floats, no timers — just millis().
+static uint8_t breathing_opa(uint32_t period_ms, uint8_t lo, uint8_t hi) {
+    uint32_t t = lv_tick_get() % period_ms;
+    uint32_t half = period_ms / 2;
+    uint32_t phase = (t < half) ? t : (period_ms - t);
+    return (uint8_t)(lo + (uint32_t)(hi - lo) * phase / half);
+}
+
+// A room-readable numeral, capped once the ladder is already screaming — the
+// exact tally past 3 doesn't change what the user needs to do.
+static void format_capped_count(int n, char* buf, size_t len) {
+    if (n >= 3) snprintf(buf, len, "3+");
+    else        snprintf(buf, len, "%d", n);
+}
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -420,6 +470,75 @@ static void init_usage_screen(lv_obj_t* scr) {
     }
 }
 
+// ======== Attention takeover screen ========
+
+// Full-bleed alert screen: big numeral, title, subtitle, plus a small
+// "link lost" mark for when the takeover itself is showing stale data.
+// Hidden by default — ui_attention_tick() is the only thing that shows it.
+static void build_alert_screen(lv_obj_t* parent) {
+    alert_container = lv_obj_create(parent);
+    lv_obj_set_size(alert_container, L.scr_w, L.scr_h);
+    lv_obj_set_pos(alert_container, 0, 0);
+    lv_obj_set_style_bg_opa(alert_container, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(alert_container, 0, 0);
+    lv_obj_set_style_radius(alert_container, 0, 0);
+    lv_obj_set_style_pad_all(alert_container, 0, 0);
+    lv_obj_clear_flag(alert_container, LV_OBJ_FLAG_SCROLLABLE);
+
+    lbl_alert_num = lv_label_create(alert_container);
+    lv_label_set_text(lbl_alert_num, "");
+    lv_obj_set_style_text_font(lbl_alert_num, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_alert_num, COL_TEXT, 0);
+    lv_obj_align(lbl_alert_num, LV_ALIGN_CENTER, 0, -40);
+
+    lbl_alert_title = lv_label_create(alert_container);
+    lv_label_set_text(lbl_alert_title, "");
+    lv_obj_set_style_text_font(lbl_alert_title, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl_alert_title, COL_TEXT, 0);
+    lv_obj_align(lbl_alert_title, LV_ALIGN_CENTER, 0, 60);
+
+    lbl_alert_sub = lv_label_create(alert_container);
+    lv_label_set_text(lbl_alert_sub, "");
+    lv_obj_set_style_text_font(lbl_alert_sub, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_alert_sub, COL_TEXT, 0);
+    lv_obj_align(lbl_alert_sub, LV_ALIGN_CENTER, 0, 100);
+
+    lbl_alert_stale = lv_label_create(alert_container);
+    lv_label_set_text(lbl_alert_stale, "link lost");
+    lv_obj_set_style_text_font(lbl_alert_stale, &font_styrene_14, 0);
+    lv_obj_set_style_text_color(lbl_alert_stale, COL_DIM, 0);
+    lv_obj_align(lbl_alert_stale, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_add_flag(lbl_alert_stale, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_add_flag(alert_container, LV_OBJ_FLAG_HIDDEN);  // ui_attention_tick decides
+}
+
+// The BLUE "your turn" chip and the calm-screen "link lost" glyph — small
+// overlays that ride on top of splash/usage, as opposed to the full-bleed
+// takeover above. Created last (topmost z-order) so they sit over both.
+static void build_attention_overlays(lv_obj_t* parent) {
+    lbl_turn_chip = lv_label_create(parent);
+    lv_label_set_text(lbl_turn_chip, "");
+    lv_obj_set_style_text_font(lbl_turn_chip, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_turn_chip, COL_TEXT, 0);
+    lv_obj_set_style_bg_color(lbl_turn_chip, COL_BLUE, 0);
+    lv_obj_set_style_bg_opa(lbl_turn_chip, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(lbl_turn_chip, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_left(lbl_turn_chip, 14, 0);
+    lv_obj_set_style_pad_right(lbl_turn_chip, 14, 0);
+    lv_obj_set_style_pad_top(lbl_turn_chip, 5, 0);
+    lv_obj_set_style_pad_bottom(lbl_turn_chip, 5, 0);
+    lv_obj_align(lbl_turn_chip, LV_ALIGN_BOTTOM_RIGHT, -L.margin, -12);
+    lv_obj_add_flag(lbl_turn_chip, LV_OBJ_FLAG_HIDDEN);
+
+    lbl_link_stale = lv_label_create(parent);
+    lv_label_set_text(lbl_link_stale, "link lost");
+    lv_obj_set_style_text_font(lbl_link_stale, &font_styrene_14, 0);
+    lv_obj_set_style_text_color(lbl_link_stale, COL_DIM, 0);
+    lv_obj_align(lbl_link_stale, LV_ALIGN_BOTTOM_LEFT, L.margin, -12);
+    lv_obj_add_flag(lbl_link_stale, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Public API ========
 
 void ui_init(void) {
@@ -434,6 +553,7 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     splash_init(scr);
+    build_alert_screen(scr);
 
     if (splash_get_root()) {
         lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
@@ -447,6 +567,7 @@ void ui_init(void) {
     lv_image_set_src(battery_img, &battery_dscs[0]);
     lv_obj_set_pos(battery_img, L.scr_w - 48 - L.margin, L.title_y);
 
+    build_attention_overlays(scr);  // topmost — rides over splash/usage
 }
 
 void ui_update(const UsageData* data) {
@@ -539,16 +660,20 @@ void ui_tick_anim(void) {
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
 static void apply_battery_visibility(void) {
     if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    // Hidden on splash (no chrome over the creature) and on the attention
+    // takeover (full-bleed — no clutter over the alert).
+    if (current_screen == SCREEN_SPLASH || current_screen == SCREEN_ALERT)
+        lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Logo shows on non-splash screens, EXCEPT while working (the work-coding badge
-// takes its top-left spot). The badge lives inside usage_container, so it's
-// naturally hidden whenever the splash screen is up.
+// Logo shows on non-splash, non-alert screens, EXCEPT while working (the
+// work-coding badge takes its top-left spot). The badge lives inside
+// usage_container, so it's naturally hidden whenever splash or the alert is up.
 static void apply_logo_visibility(void) {
     if (!logo_img) return;
-    bool show = (current_screen != SCREEN_SPLASH) && !s_working;
+    bool show = (current_screen != SCREEN_SPLASH) && (current_screen != SCREEN_ALERT) && !s_working;
     if (show) lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
 }
@@ -571,11 +696,13 @@ static void global_click_cb(lv_event_t* e) {
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
+    if (alert_container) lv_obj_add_flag(alert_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH: splash_show(); break;
     case SCREEN_USAGE:  lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_ALERT:  if (alert_container) lv_obj_clear_flag(alert_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -630,4 +757,116 @@ void ui_update_battery(int percent, bool charging) {
     }
     lv_image_set_src(battery_img, &battery_dscs[idx]);
     apply_battery_visibility();
+}
+
+void ui_set_attention(int blocked_count, int blocked_age, const char* block_project,
+                      int idle_turn, int failed_count, bool link_stale) {
+    s_blocked_count = blocked_count;
+    s_blocked_age   = blocked_age;
+    strlcpy(s_block_project, block_project ? block_project : "", sizeof(s_block_project));
+    s_idle_turn     = idle_turn;
+    s_failed_count  = failed_count;
+    s_link_stale    = link_stale;
+}
+
+// Render the takeover's content — only touches labels when something actually
+// changed, same "re-lay-out on change only" discipline as update_view_state().
+static void apply_alert_content(attn_severity_t sev) {
+    static attn_severity_t shown_sev = ATTN_CALM;
+    static int  shown_bc = -1;
+    static int  shown_fc = -1;
+    static char shown_bp[20] = "";
+
+    bool changed = (sev != shown_sev)
+                || (sev == ATTN_AMBER && (s_blocked_count != shown_bc ||
+                                          strcmp(s_block_project, shown_bp) != 0))
+                || (sev == ATTN_RED   && s_failed_count != shown_fc);
+    if (!changed) return;
+    shown_sev = sev;
+    shown_bc = s_blocked_count;
+    shown_fc = s_failed_count;
+    strlcpy(shown_bp, s_block_project, sizeof(shown_bp));
+
+    char num_buf[8];
+    char sub_buf[40];
+
+    if (sev == ATTN_RED) {
+        lv_obj_set_style_bg_color(alert_container, COL_RED, 0);
+        lv_label_set_text(lbl_alert_num, "!");
+        if (s_failed_count > 1) snprintf(sub_buf, sizeof(sub_buf), "%d FAILED", s_failed_count);
+        else                    snprintf(sub_buf, sizeof(sub_buf), "SESSION FAILED");
+        lv_label_set_text(lbl_alert_title, sub_buf);
+        lv_label_set_text(lbl_alert_sub, "");
+    } else {  // ATTN_AMBER
+        lv_obj_set_style_bg_color(alert_container, COL_ACCENT, 0);
+        format_capped_count(s_blocked_count, num_buf, sizeof(num_buf));
+        lv_label_set_text(lbl_alert_num, num_buf);
+        lv_label_set_text(lbl_alert_title, "YOUR TURN");
+        if (s_block_project[0]) snprintf(sub_buf, sizeof(sub_buf), "> %s", s_block_project);
+        else                    sub_buf[0] = '\0';
+        lv_label_set_text(lbl_alert_sub, sub_buf);
+    }
+}
+
+// The auto-manager: computes severity from the cached attention fields, drives
+// the RED/AMBER full-bleed takeover (forcing/clearing SCREEN_ALERT, remembering
+// the ring screen to return to) or the BLUE/calm small overlays, and ticks the
+// amber breathing pulse. Call every loop iteration — cheap, most ticks are just
+// flag checks.
+void ui_attention_tick(void) {
+    if (!alert_container) return;
+
+    attn_severity_t sev = compute_severity();
+
+    if (sev == ATTN_RED || sev == ATTN_AMBER) {
+        if (!s_alert_active) {
+            remembered_ring_screen = current_screen;  // never SCREEN_ALERT here
+            s_alert_active = true;
+        }
+        apply_alert_content(sev);
+
+        // Escalation, amber only, driven by how long the block has aged:
+        // <30s steady, 30-120s slow breathing, >120s faster + brighter.
+        uint8_t opa = LV_OPA_COVER;
+        if (sev == ATTN_AMBER) {
+            if (s_blocked_age < 30)       opa = LV_OPA_COVER;
+            else if (s_blocked_age < 120) opa = breathing_opa(3000, 180, 255);
+            else                          opa = breathing_opa(900, 140, 255);
+        }
+        lv_obj_set_style_bg_opa(alert_container, opa, 0);
+
+        if (current_screen != SCREEN_ALERT) ui_show_screen(SCREEN_ALERT);
+
+        if (lbl_alert_stale) {
+            if (s_link_stale) lv_obj_clear_flag(lbl_alert_stale, LV_OBJ_FLAG_HIDDEN);
+            else               lv_obj_add_flag(lbl_alert_stale, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else {
+        if (s_alert_active) {
+            s_alert_active = false;
+            ui_show_screen(remembered_ring_screen);
+        }
+
+        static int shown_it = -1;
+        if (lbl_turn_chip) {
+            if (sev == ATTN_BLUE) {
+                if (s_idle_turn != shown_it) {
+                    shown_it = s_idle_turn;
+                    char n[8], buf[24];
+                    format_capped_count(s_idle_turn, n, sizeof(n));
+                    snprintf(buf, sizeof(buf), "your turn -%s", n);
+                    lv_label_set_text(lbl_turn_chip, buf);
+                }
+                lv_obj_clear_flag(lbl_turn_chip, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                shown_it = -1;
+                lv_obj_add_flag(lbl_turn_chip, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+
+        if (lbl_link_stale) {
+            if (s_link_stale) lv_obj_clear_flag(lbl_link_stale, LV_OBJ_FLAG_HIDDEN);
+            else               lv_obj_add_flag(lbl_link_stale, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }

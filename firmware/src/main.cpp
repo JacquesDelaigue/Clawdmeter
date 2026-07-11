@@ -23,6 +23,13 @@
 
 static UsageData usage = {};
 
+// Link watchdog for the attention overlay (ui.h): the device must never show
+// a stale payload as an "all clear". Set on every successful parse+apply
+// (BLE or WiFi, both funnel through apply_usage()); ui_attention_tick() treats
+// the link as stale once this goes further back than LINK_STALE_MS.
+static uint32_t g_last_payload_ms = 0;
+#define LINK_STALE_MS 90000
+
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
 // boards (e.g. ESP32-C6) allocate from internal SRAM, so we shrink the strip
@@ -116,6 +123,12 @@ static bool parse_json(const char* json, UsageData* out) {
     // Daemon LAN address for the WiFi fallback path (present on BLE payloads).
     strlcpy(out->host, doc["host"] | "", sizeof(out->host));
     out->port = doc["port"] | 0;
+    // Attention fields (severity ladder — see ui_set_attention).
+    out->blocked_count = doc["bc"] | 0;
+    out->blocked_age   = doc["ba"] | 0;
+    strlcpy(out->block_project, doc["bp"] | "", sizeof(out->block_project));
+    out->idle_turn     = doc["it"] | 0;
+    out->failed_count  = doc["fc"] | 0;
     out->valid = true;
     return true;
 }
@@ -289,6 +302,7 @@ static void pair_tick(void) {
 // Apply a freshly-parsed payload (in the file-scope `usage`) to the UI.
 // Shared by the BLE and WiFi receive paths so both render identically.
 static void apply_usage(void) {
+    g_last_payload_ms = millis();  // link watchdog: a payload just landed, BLE or WiFi
     ui_update(&usage);
 
     static bool last_working = false;
@@ -404,6 +418,13 @@ void loop() {
             apply_usage();
         }
     }
+
+    // Attention overlay: severity ladder (RED > AMBER > BLUE > calm) + the
+    // link-stale watchdog, so a dead daemon never reads as a silent all-clear.
+    bool link_stale = (millis() - g_last_payload_ms) > LINK_STALE_MS;
+    ui_set_attention(usage.blocked_count, usage.blocked_age, usage.block_project,
+                     usage.idle_turn, usage.failed_count, link_stale);
+    ui_attention_tick();
 
     delay(5);
 }
