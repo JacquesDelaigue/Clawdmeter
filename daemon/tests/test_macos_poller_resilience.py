@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Poller resilience for the macOS daemon (2026-10-01 overnight outage).
+"""Poller and watchdog resilience for the macOS daemon (2026-10-01 outage).
 
 An InterruptedError (EINTR) raised while httpx built its SSL context escaped
 poll_api, killed the poller task, and left /usage answering stale or 503
-until the process restarted. These tests pin the three fixes:
-poll_api treats OSError as a failed poll, the poller supervisor restarts the
+until the process restarted; the watchdog task has died the same way
+(FileNotFoundError). These tests pin the four fixes: poll_api treats OSError
+as a failed poll, the supervisor restarts the poller loop and the watchdog
 loop after any exception, and a failed poll waits POLL_RETRY_SECONDS before
 the next try.
 
