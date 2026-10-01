@@ -11,14 +11,9 @@ the next try.
 Run: python -m pytest daemon/tests/test_macos_poller_resilience.py -x -q
 """
 import asyncio
-import sys
 from unittest.mock import patch
 
-import pytest
-
-pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS daemon imports bleak's CoreBluetooth backend")
-
-import daemon.claude_usage_daemon as d  # noqa: E402
+import daemon.claude_usage_daemon as d
 
 
 def _run(coro):
@@ -64,13 +59,13 @@ def test_failed_poll_waits_retry_seconds_before_next_try():
 
     async def scenario():
         stop = asyncio.Event()
-        d._force_poll = asyncio.Event()
 
         async def failing_poll(token):
             polls.append(1)
             return None
 
-        with patch.object(d, "poll_api", failing_poll), \
+        with patch.object(d, "_force_poll", asyncio.Event()), \
+             patch.object(d, "poll_api", failing_poll), \
              patch.object(d, "read_token", lambda: "t"), \
              patch.object(d, "TICK", 0.01), \
              patch.object(d, "POLL_RETRY_SECONDS", 0.5):
@@ -81,3 +76,22 @@ def test_failed_poll_waits_retry_seconds_before_next_try():
 
     _run(scenario())
     assert len(polls) == 1
+
+
+def test_watchdog_supervisor_restarts_after_crash():
+    calls = []
+
+    async def scenario():
+        stop = asyncio.Event()
+
+        async def fake_loop(stop_event):
+            calls.append(1)
+            if len(calls) == 1:
+                raise FileNotFoundError(2, "No such file or directory")
+            stop_event.set()
+
+        with patch.object(d, "_watchdog_loop", fake_loop), patch.object(d, "POLL_RETRY_SECONDS", 0.01):
+            await asyncio.wait_for(d.watchdog(stop), timeout=2)
+
+    _run(scenario())
+    assert len(calls) == 2

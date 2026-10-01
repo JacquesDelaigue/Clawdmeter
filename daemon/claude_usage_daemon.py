@@ -659,23 +659,28 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
         await _wait_any([stop_event, _force_poll], TICK)
 
 
-async def poller(stop_event: asyncio.Event) -> None:
-    """Supervisor for _poller_loop: an unexpected exception logs and restarts
-    the loop after POLL_RETRY_SECONDS instead of ending the task. Without this,
-    one stray exception left /usage at its last payload (or 503) until the
-    process restarted -- found 2026-10-01 after an overnight outage."""
+async def _supervised(name: str, loop_fn, stop_event: asyncio.Event) -> None:
+    """Run loop_fn(stop_event); if it raises, log and restart it after
+    POLL_RETRY_SECONDS instead of letting the task end. An unsupervised task
+    that dies leaves the process up but the job silently undone: on
+    2026-10-01 a dead poller left /usage at its last payload (or 503) until a
+    restart, and the watchdog has died the same way (FileNotFoundError)."""
     while not stop_event.is_set():
         try:
-            await _poller_loop(stop_event)
+            await loop_fn(stop_event)
             return
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 -- the supervisor must catch everything
-            log(f"Poller crashed ({type(e).__name__}: {e}); restarting in {POLL_RETRY_SECONDS}s")
+            log(f"{name} crashed ({type(e).__name__}: {e}); restarting in {POLL_RETRY_SECONDS}s")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=POLL_RETRY_SECONDS)
             except asyncio.TimeoutError:
                 pass
+
+
+async def poller(stop_event: asyncio.Event) -> None:
+    await _supervised("Poller", _poller_loop, stop_event)
 
 
 async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
@@ -739,7 +744,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
     return used_successfully
 
 
-async def watchdog(stop_event: asyncio.Event) -> None:
+async def _watchdog_loop(stop_event: asyncio.Event) -> None:
     """Self-heal: if the BLE link wedges (no successful write for a while — e.g.
     after the Mac sleeps and CoreBluetooth gets stuck), exit non-zero so launchd
     relaunches us with a fresh stack. Automates the manual `launchctl kickstart`."""
@@ -758,6 +763,10 @@ async def watchdog(stop_event: asyncio.Event) -> None:
             # Replace this process with a fresh one (new CoreBluetooth stack).
             # Doesn't depend on launchd KeepAlive, so it works regardless.
             os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+async def watchdog(stop_event: asyncio.Event) -> None:
+    await _supervised("Watchdog", _watchdog_loop, stop_event)
 
 
 async def main() -> None:
