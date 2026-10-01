@@ -32,6 +32,9 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
+# After a failed API poll, wait this long before the next try instead of
+# retrying every TICK; also the pause before the poller restarts after a crash.
+POLL_RETRY_SECONDS = 30
 SCAN_TIMEOUT = 8.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -414,8 +417,11 @@ async def poll_api(token: str) -> dict | None:
     try:
         async with httpx.AsyncClient(timeout=20.0) as http:
             resp = await http.post(API_URL, headers=headers, json=API_BODY)
-    except httpx.HTTPError as e:
-        log(f"API call failed: {e}")
+    except (httpx.HTTPError, OSError) as e:
+        # OSError covers InterruptedError (EINTR) and ssl.SSLError, which httpx
+        # can raise while building its SSL context during a sleep/dark wake.
+        # Before 2026-10-01 these escaped and killed the poller task for good.
+        log(f"API call failed: {type(e).__name__}: {e}")
         return None
     if resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
@@ -571,7 +577,7 @@ def notify_mac(title: str, text: str) -> None:
         pass
 
 
-async def poller(stop_event: asyncio.Event) -> None:
+async def _poller_loop(stop_event: asyncio.Event) -> None:
     """Poll the API + read the hook's state.json on a cadence, assemble the
     payload, and publish it to _latest_payload for BOTH transports.
 
@@ -583,6 +589,7 @@ async def poller(stop_event: asyncio.Event) -> None:
     """
     global _latest_payload
     last_poll = 0.0
+    last_attempt = 0.0
     api_payload: dict | None = None
     last_state_mtime = state_mtime()
     pushed_working: bool | None = None
@@ -593,8 +600,12 @@ async def poller(stop_event: asyncio.Event) -> None:
         forced = _force_poll is not None and _force_poll.is_set()
         if forced:
             _force_poll.clear()
-        do_poll = forced or (now - last_poll) >= POLL_INTERVAL
+        do_poll = forced or (
+            (now - last_poll) >= POLL_INTERVAL
+            and (now - last_attempt) >= POLL_RETRY_SECONDS
+        )
         if do_poll:
+            last_attempt = now
             token = read_token()
             if not token:
                 log("No token; skipping poll")
@@ -646,6 +657,25 @@ async def poller(stop_event: asyncio.Event) -> None:
                 block_notified = False
 
         await _wait_any([stop_event, _force_poll], TICK)
+
+
+async def poller(stop_event: asyncio.Event) -> None:
+    """Supervisor for _poller_loop: an unexpected exception logs and restarts
+    the loop after POLL_RETRY_SECONDS instead of ending the task. Without this,
+    one stray exception left /usage at its last payload (or 503) until the
+    process restarted -- found 2026-10-01 after an overnight outage."""
+    while not stop_event.is_set():
+        try:
+            await _poller_loop(stop_event)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 -- the supervisor must catch everything
+            log(f"Poller crashed ({type(e).__name__}: {e}); restarting in {POLL_RETRY_SECONDS}s")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=POLL_RETRY_SECONDS)
+            except asyncio.TimeoutError:
+                pass
 
 
 async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
