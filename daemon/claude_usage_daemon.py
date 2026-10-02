@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
 DEVICE_NAME = "Clawdmeter"
@@ -39,6 +39,10 @@ TICK = 5
 # retrying every TICK; also the pause before the poller restarts after a crash.
 POLL_RETRY_SECONDS = 30
 CONNECT_TIMEOUT = 20.0
+# macOS only: name-scan fallback when the OS is not holding the device (kept from
+# Jacques's fork; upstream dropped it. His log shows it reconnecting the device
+# whenever macOS lets the HID link go).
+SCAN_TIMEOUT = 8.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -440,19 +444,24 @@ async def retrieve_connected_macos(skip_addr: str | None = None):
 async def discover_target(skip_addr: str | None = None):
     """Return a connectable target, or None.
 
-    The daemon only ever targets the device this system already holds — it
-    never scans for a nearby device by name, so it can't grab a stranger's or
-    the wrong nearby unit. On macOS that's the system-connected peripheral (the
+    macOS (Jacques's fork): prefer the system-connected peripheral (the
     firmware advertises as an HID keyboard, so once paired the OS auto-connects
-    and holds it — HID-grabbed devices are invisible to scans anyway). On other
-    platforms it's a previously-pinned address in the cache file. If the device
-    isn't held/pinned, we log and wait rather than scanning. ``skip_addr`` skips
-    a peripheral whose handle just failed to connect.
+    and holds it; HID-grabbed devices are invisible to scans). If the OS is not
+    holding it, fall back to a scan by name, as the fork did before the 2026-10
+    upstream catch-up; upstream waits instead. ``skip_addr`` skips a peripheral
+    whose handle just failed to connect, which makes the scan reachable.
+
+    Other platforms (upstream): a previously-pinned address in the cache file;
+    if none is pinned, log and wait rather than scanning.
     """
     if sys.platform == "darwin":
         dev = await retrieve_connected_macos(skip_addr=skip_addr)
-        if dev is None:
-            log("Device not held by OS; waiting (not scanning by name)")
+        if dev is not None:
+            return dev
+        log(f"Not held by OS; scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
+        dev = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=SCAN_TIMEOUT)
+        if dev:
+            log(f"Found: {dev.address}")
         return dev
 
     address = load_cached_address()
@@ -1232,7 +1241,7 @@ async def main() -> None:
             if not ok:
                 if sys.platform == "darwin":
                     # No string cache to drop; instead skip this stale handle on
-                    # the next retrieveConnected (there is no scan fallback).
+                    # the next retrieveConnected, so the name-scan fallback is reached.
                     skip_addr = addr
                     reset_cb_manager()  # rebuild a fresh central in case it went stale
                 else:

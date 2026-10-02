@@ -5,6 +5,7 @@ Covers read_config_dirs, read_token_for, PlanSelector, and poll_active_payload.
 
 Run: python -m pytest daemon/tests/test_macos_multidir.py -x -q
 """
+from types import SimpleNamespace
 import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -182,10 +183,24 @@ def test_discover_target_darwin_uses_os_held_device(monkeypatch):
 
 
 def test_discover_target_darwin_returns_none_when_not_held(monkeypatch):
-    # Not held by the OS -> wait (return None); never grabs an arbitrary device.
+    # Not held by the OS and the name scan finds nothing -> None (wait).
+    # Jacques's fork keeps the macOS name-scan fallback; it is patched here so
+    # the test never touches the real Bluetooth radio.
     monkeypatch.setattr(mod.sys, "platform", "darwin")
-    with patch.object(mod, "retrieve_connected_macos", new=AsyncMock(return_value=None)):
+    scan = AsyncMock(return_value=None)
+    with patch.object(mod, "retrieve_connected_macos", new=AsyncMock(return_value=None)), \
+         patch.object(mod.BleakScanner, "find_device_by_name", new=scan):
         assert _run(mod.discover_target()) is None
+    scan.assert_awaited_once_with(mod.DEVICE_NAME, timeout=mod.SCAN_TIMEOUT)
+
+
+def test_discover_target_darwin_scans_by_name_when_not_held(monkeypatch):
+    # Fork behaviour: not held by the OS -> scan by name and return what it finds.
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    found = SimpleNamespace(address="EFEC9583-TEST")
+    with patch.object(mod, "retrieve_connected_macos", new=AsyncMock(return_value=None)), \
+         patch.object(mod.BleakScanner, "find_device_by_name", new=AsyncMock(return_value=found)):
+        assert _run(mod.discover_target()) is found
 
 
 def test_discover_target_non_darwin_uses_pinned_address(monkeypatch):
