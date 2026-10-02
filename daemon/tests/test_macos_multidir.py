@@ -171,8 +171,8 @@ def test_poll_active_payload_selects_higher_util_plan(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# discover_target — the daemon only ever targets the device this system already
-# holds; it never scans for a nearby device by name (there is no scan fallback).
+# discover_target — on macOS it prefers the OS-held device and falls back to a
+# scan by name (Jacques's fork); other platforms never scan by name.
 # ---------------------------------------------------------------------------
 
 def test_discover_target_darwin_uses_os_held_device(monkeypatch):
