@@ -20,6 +20,7 @@
 #include "hal/input_hal.h"
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
+#include "hal/sound_hal.h"
 
 static UsageData usage = {};
 
@@ -118,6 +119,14 @@ static bool parse_json(const char* json, UsageData* out) {
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
+    out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
+    const char* acct = doc["acct"] | "pro";
+    out->enterprise = (strcmp(acct, "ent") == 0);
+    out->time_pct = doc["tp"] | 0;
+    out->period_days = doc["pd"] | 30;
+    strlcpy(out->reset_date, doc["rd"] | "", sizeof(out->reset_date));
+    out->clock_epoch = doc["t"] | 0L;
+    out->clock_fmt = doc["tf"] | 24;
     out->ok = doc["ok"] | false;
     out->working = doc["working"] | false;
     // Daemon LAN address for the WiFi fallback path (present on BLE payloads).
@@ -182,6 +191,7 @@ static void check_serial_cmd() {
         if (c == '\n' || c == '\r') {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
+            else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -209,6 +219,7 @@ void setup() {
 
     power_hal_init();
     imu_hal_init();
+    sound_hal_init();
     touch_hal_init();
 
     // ---- LVGL ----
@@ -303,6 +314,26 @@ static void pair_tick(void) {
 // Shared by the BLE and WiFi receive paths so both render identically.
 static void apply_usage(void) {
     g_last_payload_ms = millis();  // link watchdog: a payload just landed, BLE or WiFi
+
+    // Usage-rate sampling (upstream): drives the reset chime and the corner
+    // mascot's excitement, and — only when the splash rotation is rate-driven
+    // (official animation set) — a re-pick on group change.
+    int g_before = usage_rate_group();
+    bool session_reset = usage_rate_sample(usage.session_pct);
+    int g_after = usage_rate_group();
+    // 5-hour session limit refilled → chime so the user knows they can
+    // use Claude again (no-op on boards without a buzzer). Gated on the
+    // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
+    if (session_reset && usage.chime) {
+        Serial.println("session reset detected — chime");
+        sound_hal_play_reset();
+    }
+    if (g_after != g_before) {
+        Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
+            g_before, g_after, usage.session_pct);
+        if (splash_is_active()) splash_on_rate_group_change();
+    }
+
     ui_update(&usage);
 
     static bool last_working = false;
@@ -322,7 +353,9 @@ void loop() {
     wifi_tick();
     power_hal_tick();
     imu_hal_tick();
+    sound_hal_tick();
     splash_tick();
+    splash_mascot_tick();
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
     // is detected by the next tick after wake and ramped in then.
@@ -391,6 +424,7 @@ void loop() {
     int  pct      = power_hal_battery_pct();
     bool charging = power_hal_is_charging();
     if (pct != last_pct || charging != last_charging) {
+        if (pct != last_pct) ble_set_battery_level(pct);
         last_pct = pct;
         last_charging = charging;
         ui_update_battery(pct, charging);
@@ -405,7 +439,7 @@ void loop() {
     if (ble_has_data()) {
         // BLE is the primary link.
         if (parse_json(ble_get_data(), &usage)) {
-            apply_usage();
+            apply_usage();   // rate sampling + chime (upstream) live inside, for BLE and WiFi alike
             wifi_note_ble_data();                       // reset the WiFi-takeover timer
             wifi_note_ble_host(usage.host, usage.port); // learn/cache the daemon's LAN address
             ble_send_ack();

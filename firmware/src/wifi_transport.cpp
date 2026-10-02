@@ -38,6 +38,13 @@
 #  define WIFI_RETRY_MS 15000     // re-issue WiFi.begin() this often while disconnected
 #endif
 
+// The desktop simulator (-e sim) has no WiFi stack: always use the no-op stubs
+// there, even if a local wifi_cfg.h enables WiFi for the hardware builds.
+#if defined(BOARD_SIM)
+#  undef  WIFI_ENABLED
+#  define WIFI_ENABLED 0
+#endif
+
 #if WIFI_ENABLED
 
 #include <WiFi.h>
