@@ -4,13 +4,14 @@
 
 // Which splash animations are compiled in and rotated (build flag, e.g.
 // `-DSPLASH_ANIM_SET=1` in build_flags or PLATFORMIO_BUILD_FLAGS):
-//   0  upstream's official Clawd set, rotated by usage-rate group (default)
+//   0  upstream's official Clawd set, rotated by usage-rate group
 //   1  Jacques's claudepix set incl. "skate" (splash_animations_legacy.h),
 //      flat rotation of everything except the busy "work coding"
-//   2  both sets in one flat rotation
+//   2  both sets in one flat rotation (this fork's default: Jacques chose
+//      "Both, rotating" on 2026-10-02 after seeing the simulator shots)
 // The official set stays compiled in for 1 and 2 (corner mascot, idle cloud).
 #ifndef SPLASH_ANIM_SET
-#define SPLASH_ANIM_SET 0
+#define SPLASH_ANIM_SET 2
 #endif
 
 // Initialize splash module. Creates the canvas widget inside `parent` and
