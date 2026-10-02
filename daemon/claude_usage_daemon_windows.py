@@ -7,6 +7,7 @@ later plans.
 """
 
 import asyncio
+import calendar
 import datetime
 import json
 import logging
@@ -14,23 +15,24 @@ import logging.handlers
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
 import httpx
-from bleak import BleakClient, BleakScanner
+from bleak import BleakClient
+from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 
-DEVICE_NAME = "Claude Controller"
+DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 TICK = 5
-SCAN_TIMEOUT = 8.0
 CONNECT_RETRIES = 3        # D-01: attempts before giving up on a device
 CONNECT_RETRY_DELAY = 2.0  # D-01: seconds between failed connect attempts
 ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning a half-open link
@@ -38,6 +40,11 @@ ZOMBIE_BREAK_LIMIT = 1     # D-03: consecutive write failures before abandoning 
                            # N=2 would bust the 120s budget before reconnect even begins
 RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked retries inside 120s SLA
                            # ~5–10s band per CONTEXT.md Claude's Discretion; 8 chosen as middle ground
+
+# Optional reset chime.
+# Optional clock display. 
+# Config lives under the same Clawdmeter dir as daemon.log.
+CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Clawdmeter" / "config"
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -105,6 +112,76 @@ class AuthError(Exception):
     must NOT be mislabeled as a token problem (SC#5: a boot-time `getaddrinfo
     failed` DNS blip wrongly fired the 'token expired' toast)."""
 
+def read_chime_setting() -> str:
+    """Read the `chime` option from the config file. One of: off|on.
+
+    Defaults to "off" so the device stays silent until the user opts in.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "chime":
+                    val = val.strip().lower()
+                    if val in ("off", "on"):
+                        return val
+    except OSError:
+        pass
+    return "off"
+
+
+def read_clock_setting() -> str:
+    """Read the `clock` option from the config file. One of: off|auto|12|24.
+
+    Defaults to "off" so existing setups keep showing "Usage" until opted in.
+    """
+    try:
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "clock":
+                    val = val.strip().lower()
+                    if val in ("off", "auto", "12", "24"):
+                        return val
+    except OSError:
+        pass
+    return "off"
+
+
+def add_chime_field(payload: dict) -> None:
+    """Add "c":1 to the payload when the config opts in, so the firmware may
+    sound the session-reset chime. Omitted entirely when chime is off."""
+    if read_chime_setting() == "on":
+        payload["c"] = 1
+
+
+def detect_hour_format() -> int:
+    """Best-effort 12h/24h detection on Windows via the registry. Returns 12 or 24."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International") as k:
+            # iTime: "1" = 24-hour, "0" = 12-hour.
+            val, _ = winreg.QueryValueEx(k, "iTime")
+            return 24 if str(val).strip() == "1" else 12
+    except (ImportError, OSError):
+        return 24
+
+
+def add_clock_fields(payload: dict) -> None:
+    """Add "t" (local wall-clock epoch) + "tf" (12|24) when the config opts in."""
+    clock = read_clock_setting()
+    if clock == "off":
+        return
+    tf = 24 if clock == "24" else 12 if clock == "12" else detect_hour_format()
+    payload["t"] = int(time.time()) + time.localtime().tm_gmtoff
+    payload["tf"] = tf
+
 
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
@@ -145,24 +222,152 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
-    payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
-        "ok": True,
-    }
+    if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
+        payload = {
+            "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
+            "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
+            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+            "acct": "pro",
+            "ok": True,
+        }
+    else:
+        reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
+        payload = {
+            "s": pct(hdr("anthropic-ratelimit-unified-overage-utilization")),
+            "sr": reset_minutes(reset_ts),
+            "w": 0,
+            "wr": 0,
+            "st": hdr("anthropic-ratelimit-unified-status", "unknown"),
+            "acct": "ent",
+            **_billing_period_info(now, reset_ts),
+            "ok": True,
+        }
+    add_chime_field(payload)   # adds "c":1 iff the config opts in
+    add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     return payload
 
 
-async def scan_for_device():
-    """Scan for DEVICE_NAME and return the BLEDevice, or None."""
-    log(f"Scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
-    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=SCAN_TIMEOUT)
-    if device:
-        log(f"Found: {device.address}")
-    return device  # BLEDevice or None — NOT an address string
+def _billing_period_info(now: float, reset_ts: str) -> dict:
+    """Fraction of billing period elapsed (tp, 0-100) and period length in days (pd).
+
+    Monthly window is assumed (headers expose only reset_ts, not period). Per the
+    Claude Enterprise Admin API reference, spend-limit period's "only value today
+    is monthly" — see the macOS daemon for the full note.
+    """
+    try:
+        period_end = float(reset_ts)
+    except ValueError:
+        return {"tp": 0, "pd": 30, "rd": ""}
+    if period_end <= 0:
+        # reset_ts defaults to "0" whenever the overage-reset header is absent
+        # (e.g. a 200 that simply carries no billing headers). fromtimestamp(0)
+        # is 1970; stepping one month back lands in 1969, and datetime.timestamp()
+        # raises OSError for pre-1970 dates on Windows — taking the whole poll
+        # loop down. Bail out to the neutral default instead.
+        return {"tp": 0, "pd": 30, "rd": ""}
+    try:
+        dt_end = datetime.datetime.fromtimestamp(period_end)
+        prev_month = dt_end.month - 1 or 12
+        prev_year = dt_end.year if dt_end.month > 1 else dt_end.year - 1
+        prev_day = min(dt_end.day, calendar.monthrange(prev_year, prev_month)[1])
+        dt_start = dt_end.replace(year=prev_year, month=prev_month, day=prev_day)
+        period_start = dt_start.timestamp()
+    except (OSError, OverflowError, ValueError):
+        # Belt-and-braces beyond the <= 0 guard above (#104): Windows
+        # datetime.timestamp()/fromtimestamp() also raise OSError(22)/
+        # OverflowError/ValueError for out-of-range NON-zero values (e.g. a
+        # far-future "99999999999999" header, which overflows fromtimestamp).
+        # Garbage must never crash the daemon thread — degrade to the safe
+        # default instead (field report: OSError(22) killed the poll loop).
+        return {"tp": 0, "pd": 30, "rd": ""}
+    period_len = period_end - period_start
+    if period_len <= 0:
+        return {"tp": 0, "pd": 30, "rd": ""}
+    pct_val = (now - period_start) / period_len * 100
+    return {
+        "tp": max(0, min(100, int(round(pct_val)))),
+        "pd": int(round(period_len / 86400)),
+        "rd": f"{dt_end.strftime('%b')} {dt_end.day}",
+    }
+
+
+def _mac_from_pnp_instance_id(instance_id: str) -> str | None:
+    """Recover a canonical BLE MAC ("AA:BB:CC:DD:EE:FF") from a PnP instance id.
+
+    Windows encodes a paired BLE device's address in its PnP instance id as a
+    12-hex run after a ``DEV_`` token, e.g.::
+
+        BTHLE\\DEV_98A316A5D706\\7&B8081D1&0&98A316A5D706  ->  98:A3:16:A5:D7:06
+
+    Returns None when no ``DEV_<12 hex>`` token is present. Pure — the
+    subprocess that produces the instance id lives in discover_bonded_address().
+    """
+    m = re.search(r"DEV_([0-9A-Fa-f]{12})(?![0-9A-Fa-f])", instance_id)
+    if not m:
+        return None
+    h = m.group(1).upper()
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+def discover_bonded_address() -> str | None:
+    """Return the BLE address of the bonded Clawdmeter, or None.
+
+    A device that is paired AND connected to Windows stops advertising, so
+    BleakScanner can't see it (the steady state once paired — see
+    README-windows.md). WinRT can still connect to it directly by address, so
+    we recover that address from the OS:
+
+    1. CLAWDMETER_BLE_ADDRESS env override (skips discovery — testing / pinning).
+    2. Windows PnP table, filtered to the device's FriendlyName.
+
+    Non-Windows or any failure returns None.
+    """
+    if override := os.environ.get("CLAWDMETER_BLE_ADDRESS"):
+        return override.strip().upper()
+    if sys.platform != "win32":
+        return None
+    command = (
+        "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | "
+        f"Where-Object {{ $_.FriendlyName -eq '{DEVICE_NAME}' }} | "
+        "Select-Object -ExpandProperty InstanceId"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"Bonded-address lookup failed: {e}")
+        return None
+    for line in result.stdout.splitlines():
+        if mac := _mac_from_pnp_instance_id(line):
+            return mac
+    return None
+
+
+async def acquire_target():
+    """Return a connectable handle for the Clawdmeter, or None.
+
+    Targets only the device bonded to THIS machine (via the PnP table /
+    CLAWDMETER_BLE_ADDRESS) — it never scans for a nearby device by name, so it
+    can't grab a stranger's or the wrong nearby unit. The device must be paired
+    with Windows once first (the documented setup). Returns a BLEDevice or None.
+    """
+    address = discover_bonded_address()
+    if not address:
+        return None
+    log(f"Not advertising; connecting to bonded address {address}")
+    # CRITICAL: hand BleakClient a BLEDevice, not the bare address string. WinRT's
+    # connect() resolves a bare string via an advertisement scan (find_device_by_address)
+    # — which always fails for a bonded device that has stopped advertising, the very
+    # case we are handling. A BLEDevice sets _device_info directly, so WinRT connects
+    # via from_bluetooth_address_with_bluetooth_address_type_async and skips the scan.
+    return BLEDevice(address, DEVICE_NAME, None)
 
 
 class Session:
@@ -323,8 +528,12 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     """Connect to device and poll until disconnected or stopped.
 
     Returns True if at least one successful write occurred.
+
+    `device` is a BLEDevice — either from an advertisement scan or built from the
+    bonded address by acquire_target(). The getattr keeps the log line robust if a
+    bare address string is ever passed in.
     """
-    log(f"Connecting to {device.address}...")
+    log(f"Connecting to {getattr(device, 'address', device)}...")
     # D-01: retry wrapper — defeats WinRT post-wake failure modes
     # (Could not get GATT services: Unreachable, stale is_connected).
     # Rebuild a fresh BleakClient each attempt (locked D-05 recipe).
@@ -340,8 +549,15 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
         )
         try:
             await client.connect()
-        except (BleakError, asyncio.TimeoutError) as e:
-            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed: {e}")
+        except (BleakError, OSError, asyncio.TimeoutError, AssertionError) as e:
+            # WinRT service discovery inside connect() can surface a raw OSError
+            # (WinError) or even a bare AssertionError from bleak's FutureLike
+            # (assert self._result) when the peer drops the link mid-discovery —
+            # neither is wrapped as BleakError. Treat them as a normal failed
+            # attempt so the D-01 retry loop handles them, instead of letting an
+            # uncaught exception kill the daemon thread (the "daemon crashed"
+            # tray toast + silent polling stop, field report).
+            log(f"Connection attempt {attempt + 1}/{CONNECT_RETRIES} failed: {type(e).__name__}: {e}")
             try:
                 await client.disconnect()
             except BleakError:
@@ -373,25 +589,59 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     last_poll = 0.0  # D-03: poll immediately on first connect
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
+
+    def note_write_failure() -> bool:
+        """Count a failed device write toward the zombie-link breaker.
+
+        Returns True when too many writes have failed in a row and the caller
+        should abandon the (likely zombie) link so the outer loop reconnects.
+        Applies to every device write — data payloads and no-data beats alike —
+        so a dead link still trips the breaker even when the token is also dead.
+        """
+        nonlocal consecutive_failures
+        consecutive_failures += 1
+        if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
+            log(
+                f"Zombie link detected ({consecutive_failures} consecutive"
+                f" write failures); abandoning connection"
+            )
+            return True
+        return False
+
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
+                # Pure free-ride: read whatever access token Claude Code currently
+                # holds and NEVER refresh it ourselves. Claude Code (the token's owner)
+                # does all refreshing; refreshing here would race its rotation and feed
+                # the OAuth endpoint's rate limit (429). When the token is dead we just
+                # show "No data" until the CLI re-seeds it.
                 token = read_token()  # D-09: fresh each cycle
                 if not token:
-                    log("No token; skipping poll")
+                    log("No token; signalling no-data to device")
                     if tray_state:
                         tray_state.set_error("token expired — run claude login")
+                    if await session.write_payload({"ok": False}):
+                        last_poll = time.time()
+                        consecutive_failures = 0  # D-03: healthy link
+                    elif note_write_failure():
+                        break
                 else:
+                    payload = None
+                    expired = False
                     try:
                         payload = await poll_api(token)
                     except AuthError:
-                        # Real 401/403 — token genuinely needs a refresh.
+                        # Pure free-ride: we never refresh. A 401/403 means Claude Code's
+                        # token has expired and only Claude Code (its owner) can re-seed it.
+                        expired = True
+                        log("Token expired/invalid; signalling no-data — run `claude login` "
+                            "or use the CLI to let Claude Code renew it")
                         if tray_state:
                             tray_state.set_error("token expired — run claude login")
-                        payload = None
                     if payload is not None:
                         if await session.write_payload(payload):
                             last_poll = time.time()
@@ -399,14 +649,17 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                             consecutive_failures = 0  # D-03: reset on success
                             if tray_state:
                                 tray_state.set_connected(time.time())
-                        else:
-                            consecutive_failures += 1
-                            if consecutive_failures >= ZOMBIE_BREAK_LIMIT:
-                                log(
-                                    f"Zombie link detected ({consecutive_failures} consecutive"
-                                    f" write failures); abandoning connection"
-                                )
-                                break
+                        elif note_write_failure():
+                            break
+                    elif expired:
+                        # Token genuinely dead -> show "No data" now instead of stale numbers.
+                        # Transient poll failures (payload None without expiry) stay silent.
+                        log("No data (token dead); signalling idle to device")
+                        if await session.write_payload({"ok": False}):
+                            last_poll = time.time()
+                            consecutive_failures = 0  # D-03: healthy link
+                        elif note_write_failure():
+                            break
                     # else: payload is None from a TRANSIENT failure (network/DNS,
                     # timeout, rate-limit, 5xx). poll_api already logged it; do NOT
                     # toast "token expired" — that mislabeled a boot-time DNS blip
@@ -425,7 +678,10 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
         # so swallow both; the link tears down regardless once we exit.
         try:
             await client.disconnect()
-        except (BleakError, OSError):
+        except (BleakError, OSError, AssertionError):
+            # bleak's WinRT disconnect() also has bare asserts (e.g. assert char
+            # while tearing down notifications on an already-gone peer); swallow
+            # it too — the link tears down regardless once we exit.
             pass
 
     log("Device disconnected" if not stop_event.is_set() else "Stopping")
@@ -479,7 +735,7 @@ async def main(tray_state=None) -> None:
     search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
     reconnect_backoff = 1  # caps at RECONNECT_BACKOFF_CAP — fast, to clear the 120s SLA after a drop
     while not stop_event.is_set():
-        device = await scan_for_device()
+        device = await acquire_target()
         if not device:
             # Slow-search regime: device was not found by scan — back off gently
             if tray_state:
