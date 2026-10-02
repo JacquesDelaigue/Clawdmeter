@@ -2,6 +2,17 @@
 #include <stdint.h>
 #include <lvgl.h>
 
+// Which splash animations are compiled in and rotated (build flag, e.g.
+// `-DSPLASH_ANIM_SET=1` in build_flags or PLATFORMIO_BUILD_FLAGS):
+//   0  upstream's official Clawd set, rotated by usage-rate group (default)
+//   1  Jacques's claudepix set incl. "skate" (splash_animations_legacy.h),
+//      flat rotation of everything except the busy "work coding"
+//   2  both sets in one flat rotation
+// The official set stays compiled in for 1 and 2 (corner mascot, idle cloud).
+#ifndef SPLASH_ANIM_SET
+#define SPLASH_ANIM_SET 0
+#endif
+
 // Initialize splash module. Creates the canvas widget inside `parent` and
 // allocates the 480x480 pixel buffer (PSRAM).
 void splash_init(lv_obj_t *parent);
@@ -28,6 +39,10 @@ void splash_on_rate_group_change(void);
 
 // True if the compiled-in catalog has an animation with this exact name.
 bool splash_has_anim(const char *name);
+
+// Jump straight to the named animation (simulator start hook, debugging).
+// Returns false if no such animation is compiled in.
+bool splash_select(const char *name);
 
 // Working-mode (fork feature): while Claude Code is actively running the splash
 // "homes" to the busy animation ("work coding" when Jacques's set is compiled

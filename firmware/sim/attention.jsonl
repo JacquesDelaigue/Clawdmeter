@@ -1,0 +1,7 @@
+# Fork scenario: attention beacon + working mode (SIM_SCENARIO=sim/attention.jsonl).
+# bc/ba/bp = sessions blocked on you (AMBER takeover), fc = failed sessions (RED),
+# working = Claude Code running (busy badge on the usage screen, busy splash).
+{"name":"working","hold_ms":4000,"s":42.0,"sr":180,"w":33.0,"wr":7900,"st":"allowed","ok":true,"t":1785474000,"tf":24,"working":true}
+{"name":"amber: 2 blocked","hold_ms":4000,"s":42.0,"sr":180,"w":33.0,"wr":7900,"st":"allowed","ok":true,"bc":2,"ba":12,"bp":"athena"}
+{"name":"red: session failed","hold_ms":4000,"s":42.0,"sr":180,"w":33.0,"wr":7900,"st":"allowed","ok":true,"fc":1}
+{"name":"calm","hold_ms":4000,"s":42.0,"sr":180,"w":33.0,"wr":7900,"st":"allowed","ok":true}

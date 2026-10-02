@@ -1,6 +1,9 @@
 #include "splash.h"
 #include "splash_animations.h"
 #include "splash_geometry.h"
+#if SPLASH_ANIM_SET != 0
+#include "splash_animations_legacy.h"
+#endif
 #include "theme.h"
 #include "usage_rate.h"
 #include "hal/board_caps.h"
@@ -20,6 +23,33 @@
 // frame centered on the 60×60 stage. The oversized stage leaves room to later
 // translate animations across the screen (walks, lurking).
 #define GRID         SPLASH_GRID
+
+// ─── Animation catalog (SPLASH_ANIM_SET, see splash.h) ──────────────────────
+// Indices [0, SPLASH_ANIM_COUNT) are upstream's official Clawd set and are
+// always compiled in (the corner mascot, the idle "cloud" and the "laptop"
+// badge use them). Jacques's claudepix set follows when SPLASH_ANIM_SET is 1
+// or 2. SEL_FIRST/SEL_COUNT is the range the splash rotates through and the
+// PWR button cycles through.
+#if SPLASH_ANIM_SET != 0
+#  define CAT_COUNT (SPLASH_ANIM_COUNT + SPLASH_LEGACY_COUNT)
+static inline const splash_anim_def_t& cat(int i) {
+    return (i < SPLASH_ANIM_COUNT) ? splash_anims[i] : splash_legacy_anims[i - SPLASH_ANIM_COUNT];
+}
+#else
+#  define CAT_COUNT SPLASH_ANIM_COUNT
+static inline const splash_anim_def_t& cat(int i) { return splash_anims[i]; }
+#endif
+#if SPLASH_ANIM_SET == 1          // Jacques's set only
+#  define SEL_FIRST SPLASH_ANIM_COUNT
+#  define SEL_COUNT SPLASH_LEGACY_COUNT
+#else                             // official (0) or both (2)
+#  define SEL_FIRST 0
+#  define SEL_COUNT CAT_COUNT
+#endif
+// Official set: rotation is driven by usage-rate groups (upstream). Jacques's
+// set / both: a flat round-robin over every selectable animation except the
+// busy one, independent of usage rate (fork commit 6aa3cf5).
+#define SPLASH_RATE_DRIVEN (SPLASH_ANIM_SET == 0)
 static int  cell      = 8;         // recomputed in splash_init()
 static int  canvas_w  = GRID * 8;
 static int  canvas_h  = GRID * 8;
@@ -238,6 +268,10 @@ static const uint8_t* compose_stage(const splash_anim_def_t *a, uint16_t frame) 
     return stage_cells;
 }
 
+static int8_t  idle_list[CAT_COUNT];      // flat playlist (SPLASH_ANIM_SET 1/2)
+static uint8_t idle_size = 0;
+static uint8_t idle_pos  = 0;
+
 static void resolve_group_lists(void) {
     for (int g = 0; g < GROUP_COUNT; g++) {
         group_size[g] = 0;
@@ -245,8 +279,8 @@ static void resolve_group_lists(void) {
             group_lists[g][s] = -1;
             const char* want = GROUP_NAMES[g][s];
             if (!want) continue;
-            for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
-                if (strcmp(splash_anims[i].name, want) == 0) {
+            for (int i = 0; i < CAT_COUNT; i++) {
+                if (strcmp(cat(i).name, want) == 0) {
                     group_lists[g][group_size[g]++] = (int8_t)i;
                     break;
                 }
@@ -360,7 +394,7 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
 //      (upstream format). Independent of the full-screen splash above. ----
 static void mini_render(splash_mini_t *m) {
     if (!m->buf || m->anim_idx < 0) return;
-    const splash_anim_def_t *a = &splash_anims[m->anim_idx];
+    const splash_anim_def_t *a = &cat(m->anim_idx);
     const int aw = a->w, ah = a->h;
     const uint8_t *cells = &a->frames[(size_t)m->frame * aw * ah];
     const uint16_t *pal = a->palette;
@@ -378,8 +412,8 @@ static void mini_render(splash_mini_t *m) {
 }
 
 static int anim_index(const char *name) {
-    for (int i = 0; i < SPLASH_ANIM_COUNT; i++)
-        if (strcmp(splash_anims[i].name, name) == 0) return i;
+    for (int i = 0; i < CAT_COUNT; i++)
+        if (strcmp(cat(i).name, name) == 0) return i;
     return -1;
 }
 
@@ -392,7 +426,7 @@ lv_obj_t* splash_mini_create(splash_mini_t *m, lv_obj_t *parent, const char *ani
     m->frame = 0;
     const int idx = anim_index(anim_name);
     if (idx < 0) return NULL;
-    const splash_anim_def_t *a = &splash_anims[idx];
+    const splash_anim_def_t *a = &cat(idx);
     const int amax = (a->w > a->h) ? a->w : a->h;
     m->cell = px / amax;
     if (m->cell < 1) m->cell = 1;
@@ -415,7 +449,7 @@ lv_obj_t* splash_mini_create(splash_mini_t *m, lv_obj_t *parent, const char *ani
 
 void splash_mini_tick(splash_mini_t *m) {
     if (!m->buf || m->anim_idx < 0) return;
-    const splash_anim_def_t *a = &splash_anims[m->anim_idx];
+    const splash_anim_def_t *a = &cat(m->anim_idx);
     if (a->frame_count == 0) return;
     if (millis() - m->started < a->holds[m->frame]) return;
     m->started = millis();
@@ -466,8 +500,8 @@ static const char* MAS_ACTS_BY_RATE[4][4] = {
 static const uint16_t MAS_STILL_MS_BY_RATE[4] = { 10000, 7000, 5000, 3500 };
 
 static const splash_anim_def_t* anim_by_name(const char *n) {
-    for (int i = 0; i < SPLASH_ANIM_COUNT; i++)
-        if (strcmp(splash_anims[i].name, n) == 0) return &splash_anims[i];
+    for (int i = 0; i < CAT_COUNT; i++)
+        if (strcmp(cat(i).name, n) == 0) return &cat(i);
     return NULL;
 }
 
@@ -747,7 +781,11 @@ void splash_init(lv_obj_t *parent) {
     busy_idx = anim_index("work coding");
     if (busy_idx < 0) busy_idx = anim_index("laptop");
 
-    if (SPLASH_ANIM_COUNT == 0) {
+    idle_size = 0;
+    for (int i = SEL_FIRST; i < SEL_FIRST + SEL_COUNT; i++)
+        if (i != busy_idx) idle_list[idle_size++] = (int8_t)i;
+
+    if (CAT_COUNT == 0) {
         show_placeholder();
     } else {
         lv_obj_add_flag(label_status, LV_OBJ_FLAG_HIDDEN);
@@ -755,7 +793,7 @@ void splash_init(lv_obj_t *parent) {
         // PSRAM path pre-renders frame 0 into the canvas buffer. The direct
         // path draws nothing here — render_frame() bails while inactive, so the
         // splash never paints to the panel before it's actually shown.
-        const splash_anim_def_t *a = &splash_anims[0];
+        const splash_anim_def_t *a = &cat(SEL_FIRST);
         render_frame(compose_stage(a, 0), a->palette);
 #endif
         frame_started_ms = millis();
@@ -765,19 +803,19 @@ void splash_init(lv_obj_t *parent) {
 }
 
 void splash_tick(void) {
-    if (!active || SPLASH_ANIM_COUNT == 0) return;
+    if (!active || CAT_COUNT == 0) return;
     const uint32_t now = millis();
 
 #if SPLASH_DIRECT_DRAW
     // Deferred full repaint after a (re)show — runs now that LVGL has drawn the
     // black background this loop iteration.
     if (force_full) {
-        const splash_anim_def_t *fa = &splash_anims[cur_anim];
+        const splash_anim_def_t *fa = &cat(cur_anim);
         if (fa->frame_count) render_frame(compose_stage(fa, cur_frame), fa->palette);
     }
 #endif
 
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
+    const splash_anim_def_t *a = &cat(cur_anim);
     if (a->frame_count == 0) return;
 
     if (walk_active) walk_choreo(a);
@@ -857,12 +895,14 @@ void splash_tick(void) {
 }
 
 void splash_next(void) {
-    if (SPLASH_ANIM_COUNT == 0) return;
-    cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
+    if (CAT_COUNT == 0) return;
+    int rel = (int)cur_anim - SEL_FIRST;
+    if (rel < 0 || rel >= SEL_COUNT) rel = -1;          // outside the selectable range
+    cur_anim = (uint16_t)(SEL_FIRST + (rel + 1) % SEL_COUNT);
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
+    const splash_anim_def_t *a = &cat(cur_anim);
     anim_reset(a);
     render_frame(compose_stage(a, 0), a->palette);
     Serial.printf("splash: -> %s\n", a->name);
@@ -871,18 +911,18 @@ void splash_next(void) {
 
 // Switch to a specific animation by catalog index.
 static void show_index(int idx) {
-    if (idx < 0 || idx >= SPLASH_ANIM_COUNT) return;
+    if (idx < 0 || idx >= CAT_COUNT) return;
     cur_anim = (uint16_t)idx;
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
+    const splash_anim_def_t *a = &cat(cur_anim);
     anim_reset(a);
     render_frame(compose_stage(a, 0), a->palette);
 }
 
 // Upstream's idle rotation: the next animation in the current usage-rate group.
-static void pick_rate_group(void) {
+[[maybe_unused]] static void pick_rate_group(void) {
     int g = usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;
     if (group_size[g] == 0) return;
@@ -895,20 +935,33 @@ static void pick_rate_group(void) {
 // Single entry point for every automatic pick (show, rotation, outro
 // completion, walk-home, working-mode snap-back).
 static void pick_next(void) {
-    if (SPLASH_ANIM_COUNT == 0) return;
+    if (CAT_COUNT == 0) return;
     if (working_mode && busy_idx >= 0) {
         manual_override = false;
         show_index(busy_idx);
         return;
     }
+#if SPLASH_RATE_DRIVEN
     pick_rate_group();
+#else
+    if (idle_size == 0) return;
+    show_index(idle_list[idle_pos++ % idle_size]);
+#endif
 }
 
 void splash_pick_for_current_rate(void) { pick_next(); }
 
 void splash_on_rate_group_change(void) {
+    if (!SPLASH_RATE_DRIVEN) return;   // flat playlist ignores usage rate
     if (working_mode) return;          // stay on the busy animation
     pick_next();
+}
+
+bool splash_select(const char *name) {
+    const int idx = anim_index(name);
+    if (idx < 0) return false;
+    show_index(idx);
+    return true;
 }
 
 bool splash_is_active(void) { return active; }
