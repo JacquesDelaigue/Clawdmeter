@@ -10,6 +10,7 @@ import asyncio
 import calendar
 import datetime
 import getpass
+import ipaddress
 import json
 import os
 import re
@@ -69,12 +70,21 @@ STALE_RESTART_SECONDS = 300
 # wifi_transport.cpp). Bound to all interfaces so the device can reach it on the
 # local network. The daemon stamps its own LAN IP + this port into the BLE
 # payload, so the device learns where to pull from with no hardcoded address.
+# Binding to all interfaces is not the same as answering everyone: only loopback
+# (127.0.0.0/8, ::1, ::ffff:127.x) and the exact addresses listed in
+# CLAWDMETER_ALLOW_IPS (comma-separated exact IPv4 addresses, e.g. the meter's
+# DHCP lease; the server is IPv4-only, so IPv6 entries never match)
+# get an answer; anyone else gets an empty 403 and one "refused /usage from <ip>"
+# log line per IP per minute — that line is how you find the meter's address.
+# Empty or unset = loopback only. There is no allow-all value: CIDRs, "*" and the
+# unspecified, multicast and broadcast addresses are rejected.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(os.environ.get("CLAWDMETER_PORT", "47800"))
 # Optional shared secret. If set (here or via the env var), /usage requires a
 # matching ?token=. Must equal WIFI_TOKEN in the firmware's wifi_cfg.h. Empty =
-# open endpoint (fine on a trusted home/office LAN).
+# no token (the IP allow-list above still applies).
 HTTP_TOKEN = os.environ.get("CLAWDMETER_TOKEN", "")
+HTTP_ALLOW_IPS_RAW = os.environ.get("CLAWDMETER_ALLOW_IPS", "")
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -763,8 +773,72 @@ def lan_ip() -> str:
         s.close()
 
 
+def _normalise_ip(raw: str) -> str | None:
+    """Canonical text form of an address, with ::ffff:a.b.c.d folded to a.b.c.d.
+    None if it isn't a single IPv4/IPv6 address."""
+    try:
+        addr = ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return str(addr)
+
+
+def parse_allow_ips(raw: str) -> frozenset[str]:
+    """Parse CLAWDMETER_ALLOW_IPS into normalised addresses. Empty entries are
+    skipped; anything else that isn't a plain address is ignored and logged."""
+    allowed = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        ip = _normalise_ip(entry)
+        if ip is not None:
+            a = ipaddress.ip_address(ip)
+            if a.is_unspecified or a.is_multicast or ip == "255.255.255.255":
+                ip = None
+        if ip is None:
+            log(f"CLAWDMETER_ALLOW_IPS: ignoring invalid entry {entry!r}")
+            continue
+        allowed.add(ip)
+    return frozenset(allowed)
+
+
+def client_allowed(ip: str, allow: frozenset) -> bool:
+    """True for loopback or an exact match in `allow`. Mapping happens before the
+    loopback test, so ::ffff:127.0.0.1 counts as loopback on every Python."""
+    n = _normalise_ip(ip)
+    if n is None:
+        return False
+    return ipaddress.ip_address(n).is_loopback or n in allow
+
+
+HTTP_ALLOW_IPS = parse_allow_ips(HTTP_ALLOW_IPS_RAW)
+
+REFUSAL_LOG_SECONDS = 60
+REFUSAL_LOG_MAX_IPS = 256
+_refusal_logged_at: dict[str, float] = {}  # ip -> monotonic time of its last log line; least recently refused first
+_refusal_lock = threading.Lock()
+
+
+def _log_refusal(ip: str) -> None:
+    """Log "refused /usage from <ip>" at most once per IP per REFUSAL_LOG_SECONDS."""
+    now = time.monotonic()
+    with _refusal_lock:
+        last = _refusal_logged_at.pop(ip, None)
+        if last is not None and now - last < REFUSAL_LOG_SECONDS:
+            _refusal_logged_at[ip] = last
+            return
+        _refusal_logged_at[ip] = now
+        while len(_refusal_logged_at) > REFUSAL_LOG_MAX_IPS:
+            del _refusal_logged_at[next(iter(_refusal_logged_at))]
+    log(f"refused /usage from {ip}")
+
+
 class _UsageHandler(BaseHTTPRequestHandler):
-    """Serves the latest payload at GET /usage (token-checked if configured)."""
+    """Serves the latest payload at GET /usage to loopback and CLAWDMETER_ALLOW_IPS
+    only (token-checked too, if configured)."""
 
     def _send(self, code: int, body: bytes = b"") -> None:
         self.send_response(code)
@@ -776,6 +850,11 @@ class _UsageHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        ip = self.client_address[0]
+        if not client_allowed(ip, HTTP_ALLOW_IPS):
+            _log_refusal(ip)
+            self._send(403)
+            return
         u = urlparse(self.path)
         if u.path != "/usage":
             self._send(404)
@@ -802,7 +881,7 @@ def start_http_server() -> None:
         return
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     extra = " [token required]" if HTTP_TOKEN else ""
-    log(f"HTTP server on {lan_ip()}:{HTTP_PORT} (GET /usage){extra}")
+    log(f"HTTP server on {lan_ip()}:{HTTP_PORT} (GET /usage){extra} [allow: loopback + {len(HTTP_ALLOW_IPS)}]")
 
 
 class Session:
