@@ -216,6 +216,8 @@ Two constraints to know:
 
 **Optional auth:** for a shared secret, set `WIFI_TOKEN` in `wifi_cfg.h` to a matching value and run the daemon with `CLAWDMETER_TOKEN=<same value>` in its environment (add it to the LaunchAgent's `EnvironmentVariables` on macOS). The endpoint then rejects requests without `?token=`. Leave both empty for an open endpoint on a trusted LAN. The port is configurable via `CLAWDMETER_PORT` (daemon) / `WIFI_HOST_PORT` (firmware) — keep them equal.
 
+**Who gets an answer (macOS daemon):** `/usage` answers only loopback and the addresses in `CLAWDMETER_ALLOW_IPS`, a comma-separated list of exact IPv4/IPv6 addresses such as `CLAWDMETER_ALLOW_IPS=192.168.1.50`. Set it in the LaunchAgent's `EnvironmentVariables`. Everyone else gets an empty 403. If the list is empty or unset, only loopback is answered, so the device's Wi-Fi fallback is refused until you add its IP. Each refused IP is logged once a minute as `refused /usage from <ip>`; that line tells you the meter's address. Because the list is checked before the token, this applies with or without `CLAWDMETER_TOKEN`. A check from the Mac itself must use `curl http://127.0.0.1:47800/usage`, because a request to the Mac's own LAN IP comes from that LAN IP and is refused.
+
 ## Physical buttons
 
 The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
