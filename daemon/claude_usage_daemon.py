@@ -72,15 +72,17 @@ STALE_RESTART_SECONDS = 300
 # payload, so the device learns where to pull from with no hardcoded address.
 # Binding to all interfaces is not the same as answering everyone: only loopback
 # (127.0.0.0/8, ::1, ::ffff:127.x) and the exact addresses listed in
-# CLAWDMETER_ALLOW_IPS (comma-separated IPv4/IPv6, e.g. the meter's DHCP lease)
+# CLAWDMETER_ALLOW_IPS (comma-separated exact IPv4 addresses, e.g. the meter's
+# DHCP lease; the server is IPv4-only, so IPv6 entries never match)
 # get an answer; anyone else gets an empty 403 and one "refused /usage from <ip>"
 # log line per IP per minute — that line is how you find the meter's address.
-# Empty or unset = loopback only. There is no allow-all value (CIDRs are ignored).
+# Empty or unset = loopback only. There is no allow-all value: CIDRs, "*" and the
+# unspecified, multicast and broadcast addresses are rejected.
 HTTP_HOST = "0.0.0.0"
 HTTP_PORT = int(os.environ.get("CLAWDMETER_PORT", "47800"))
 # Optional shared secret. If set (here or via the env var), /usage requires a
 # matching ?token=. Must equal WIFI_TOKEN in the firmware's wifi_cfg.h. Empty =
-# open endpoint (fine on a trusted home/office LAN).
+# no token (the IP allow-list above still applies).
 HTTP_TOKEN = os.environ.get("CLAWDMETER_TOKEN", "")
 HTTP_ALLOW_IPS_RAW = os.environ.get("CLAWDMETER_ALLOW_IPS", "")
 
@@ -792,6 +794,10 @@ def parse_allow_ips(raw: str) -> frozenset[str]:
         if not entry:
             continue
         ip = _normalise_ip(entry)
+        if ip is not None:
+            a = ipaddress.ip_address(ip)
+            if a.is_unspecified or a.is_multicast or ip == "255.255.255.255":
+                ip = None
         if ip is None:
             log(f"CLAWDMETER_ALLOW_IPS: ignoring invalid entry {entry!r}")
             continue
@@ -812,7 +818,7 @@ HTTP_ALLOW_IPS = parse_allow_ips(HTTP_ALLOW_IPS_RAW)
 
 REFUSAL_LOG_SECONDS = 60
 REFUSAL_LOG_MAX_IPS = 256
-_refusal_logged_at: dict[str, float] = {}  # ip -> monotonic time of its last log line, oldest first
+_refusal_logged_at: dict[str, float] = {}  # ip -> monotonic time of its last log line; least recently refused first
 _refusal_lock = threading.Lock()
 
 

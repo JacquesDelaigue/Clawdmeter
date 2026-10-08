@@ -53,6 +53,11 @@ def test_parse_ignores_and_logs_invalid_entry(capsys):
     assert "'not-an-ip'" in out and "'192.168.1.0/24'" in out
 
 
+def test_parse_rejects_wildcard_like_entries(capsys):
+    assert d.parse_allow_ips("*, 0.0.0.0, ::, 224.0.0.1, 255.255.255.255") == frozenset()
+    assert capsys.readouterr().out.count("ignoring invalid entry") == 5
+
+
 def test_parse_ipv6_and_mapped_are_normalised():
     got = d.parse_allow_ips("FE80:0:0::1, ::ffff:192.168.1.50")
     assert got == frozenset({"fe80::1", "192.168.1.50"})
@@ -138,6 +143,18 @@ def test_allow_listed_lan_ip_gets_200(server):
     with patch.object(d, "HTTP_ALLOW_IPS", d.parse_allow_ips(LAN_IP)):
         code, body = _get(server)
     assert code == 200 and json.loads(body) == {"s": 42}
+
+
+def test_refused_ip_with_correct_token_still_gets_403(server):
+    server.fake_addr = (LAN_IP, 5555)
+    with patch.object(d, "HTTP_TOKEN", "sekret"):
+        assert _get(server, "/usage?token=sekret") == (403, b"")
+
+
+def test_allowed_caller_routing_unchanged(server):
+    assert _get(server, "/other")[0] == 404
+    with patch.object(d, "_latest_payload", None):
+        assert _get(server)[0] == 503
 
 
 def test_token_still_checked_after_allow_list(server):
