@@ -12,6 +12,7 @@ import datetime
 import getpass
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -39,6 +40,9 @@ TICK = 5
 # After a failed API poll, wait this long before the next try instead of
 # retrying every TICK; also the pause before the poller restarts after a crash.
 POLL_RETRY_SECONDS = 30
+# A reading with no successful poll for this long is served with ok:false, so a
+# run of failed polls (429, network) can't leave old numbers marked trusted.
+STALE_AFTER_SECONDS = 600
 CONNECT_TIMEOUT = 20.0
 # macOS only: name-scan fallback when the OS is not holding the device (kept from
 # Jacques's fork; upstream dropped it. His log shows it reconnecting the device
@@ -371,6 +375,17 @@ _last_success_ts = 0.0  # time.time() of the last successful BLE write (for the 
 # across an await). The two asyncio.Events are created in main() once a loop is
 # running.
 _latest_payload: dict | None = None
+_api_success_ts = 0.0  # time.time() of the last successful API poll
+
+
+def served_payload(payload: dict | None) -> dict | None:
+    """The payload as served: ok:false once no API poll has succeeded for
+    STALE_AFTER_SECONDS. Checked at serve time from a module-level stamp, so a
+    poller restart can't leave an old reading marked trusted."""
+    if (payload is not None and payload.get("ok")
+            and time.time() - _api_success_ts > STALE_AFTER_SECONDS):
+        return {**payload, "ok": False}
+    return payload
 _latest_lock = threading.Lock()
 _payload_updated: asyncio.Event | None = None  # poller → BLE sender: a push-worthy change landed
 _force_poll: asyncio.Event | None = None        # BLE sender → poller: device asked for a refresh
@@ -598,6 +613,8 @@ async def poll_api(token: str) -> dict | None:
             r = float(reset_ts)
         except ValueError:
             return 0
+        if not math.isfinite(r):
+            return 0
         mins = (r - now) / 60.0
         return int(round(mins)) if mins > 0 else 0
 
@@ -607,16 +624,54 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
+    def window_pct(name: str) -> int | None:
+        """A window's utilization as a %, or None when it is missing, empty,
+        not a number, infinite or negative. pct() would turn any of those into
+        a trusted 0%; the caller makes it a failed poll instead."""
+        raw = resp.headers.get(name)
+        try:
+            util = float(raw)
+        except (TypeError, ValueError):
+            util = float("nan")
+        if not math.isfinite(util) or util < 0:
+            log(f"API {name} unreadable: {str(raw)[:40]!r}")
+            return None
+        return int(round(util * 100))
+
     # Pro/Max accounts expose 5h/7d windows; Enterprise/overage use a single
-    # spending-limit model reported via overage-utilization.
-    if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
+    # spending-limit model reported via overage-utilization. Branches key on a
+    # header being present (even empty), so a blank value fails its window's
+    # check rather than falling through to the next branch. Any 5h header at
+    # all means a 5h window exists, so its utilization is then required.
+    if any(k.lower().startswith("anthropic-ratelimit-unified-5h-") for k in resp.headers):
+        s = window_pct("anthropic-ratelimit-unified-5h-utilization")
+        w = window_pct("anthropic-ratelimit-unified-7d-utilization")
+        if s is None or w is None:
+            return None
         payload = {
-            "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
+            "s": s,
             "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "w": w,
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
+            "ok": True,
+        }
+    elif "anthropic-ratelimit-unified-7d-utilization" in resp.headers:
+        # No 5-hour limit, only the 7-day window (seen on a Max account from
+        # 2026-10-31). Upstream's "week" wire format: s 0 and sr -1 mean "no
+        # session window", so readers that know "week" skip the 5h ceiling and
+        # older firmware still draws the weekly bar.
+        w = window_pct("anthropic-ratelimit-unified-7d-utilization")
+        if w is None:
+            return None
+        payload = {
+            "s": 0,
+            "sr": -1,
+            "w": w,
+            "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "st": hdr("anthropic-ratelimit-unified-7d-status", "unknown"),
+            "acct": "week",
             "ok": True,
         }
     else:
@@ -652,7 +707,7 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
         period_end = float(reset_ts)
     except ValueError:
         return {"tp": 0, "pd": 30}
-    if period_end <= 0:
+    if not math.isfinite(period_end) or period_end <= 0:
         # reset_ts defaults to "0" when the overage-reset header is absent.
         # fromtimestamp(0) is 1970; stepping a month back lands in 1969, and
         # datetime.timestamp() raises OSError for pre-1970 dates on Windows.
@@ -690,6 +745,7 @@ class PlanSelector:
         self.prev_s: dict[Path, int] = {}
         self.last_active: dict[Path, int] = {}
         self.seq = 0
+        self.active: Path | None = None
 
     def choose(self, sessions: dict[Path, int]) -> Path:
         """Update state from this cycle's {dir: session_pct} and return the active dir."""
@@ -699,7 +755,8 @@ class PlanSelector:
                 self.last_active[d] = self.seq
             self.prev_s[d] = s
         # Most recent activity wins; ties (and the startup case) break by highest %.
-        return max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+        self.active = max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+        return self.active
 
 
 # Module-level so the active-plan state survives reconnects.
@@ -740,9 +797,19 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
         any_live = True
         if payload is not None:
             payloads[d] = payload
-            sessions[d] = int(payload.get("s", 0) or 0)
+            # A "week" account has no session window (s is a placeholder 0), so
+            # its weekly % is what rises with use.
+            key = "w" if payload.get("acct") == "week" else "s"
+            sessions[d] = int(payload.get(key, 0) or 0)
     if not payloads:
         return None, not any_live
+    if selector.active in dirs and selector.active not in payloads:
+        # The active plan gave no reading this cycle. Switching to another
+        # plan's (possibly lower) numbers would hide that, so this cycle is a
+        # failed poll; the served reading goes stale after STALE_AFTER_SECONDS.
+        # A plan removed from config_dirs no longer holds the choice.
+        log(f"Active plan {selector.active} gave no reading; not switching")
+        return None, False
     active = selector.choose(sessions)
     if len(dirs) > 1:
         log(f"Active plan: {active} (s={sessions[active]})")
@@ -863,7 +930,7 @@ class _UsageHandler(BaseHTTPRequestHandler):
             self._send(403)
             return
         with _latest_lock:
-            payload = _latest_payload
+            payload = served_payload(_latest_payload)
         if payload is None:
             self._send(503)  # nothing polled yet
             return
@@ -1055,8 +1122,9 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
     nudged (via _payload_updated) on a push-worthy change, preserving the
     original poll-or-state-change push policy and BLE write frequency.
     """
-    global _latest_payload
+    global _latest_payload, _api_success_ts
     last_poll = 0.0
+    unpublished_ts = 0.0  # a successful poll's time, until its payload is published
     last_attempt = 0.0
     api_payload: dict | None = None
     last_state_mtime = state_mtime()
@@ -1083,6 +1151,7 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
             if p is not None:
                 api_payload = p
                 last_poll = time.time()
+                unpublished_ts = last_poll
             elif dead:
                 # No live token in any config dir (missing, or a 401/expired
                 # token) -> mark the data not-ok. We keep the last numbers and
@@ -1117,6 +1186,11 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
             payload["port"] = HTTP_PORT
             with _latest_lock:
                 _latest_payload = payload
+                # Stamp freshness only with the payload it belongs to, so a
+                # crash between poll and publish can't re-trust an old reading.
+                if unpublished_ts:
+                    _api_success_ts = unpublished_ts
+                    unpublished_ts = 0.0
             # Level-triggered (full state every push); also push the moment
             # attention itself changes (not just on poll/working-flip) so the
             # beacon reacts within a TICK (~5s) instead of waiting for the
@@ -1221,7 +1295,7 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                     _force_poll.set()
 
             with _latest_lock:
-                payload = dict(_latest_payload) if _latest_payload is not None else None
+                payload = dict(served_payload(_latest_payload)) if _latest_payload is not None else None
             if payload is not None and payload != last_sent:
                 if await session.write_payload(payload):
                     used_successfully = True
