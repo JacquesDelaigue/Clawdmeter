@@ -129,7 +129,20 @@ def test_week_accounts_are_chosen_by_weekly_use():
         assert second["w"] == 11
 
 
-def test_failed_polls_expire_a_trusted_reading():
+def test_served_reading_expires_after_failed_polls():
+    """Freshness is checked when the reading is served, from a module-level
+    stamp, so it survives a poller restart (round-2 finding)."""
+    reading = {"acct": "week", "s": 0, "sr": -1, "w": 28, "wr": 100, "ok": True}
+    with patch.object(d, "_api_success_ts", time.time()):
+        assert d.served_payload(reading)["ok"] is True
+    with patch.object(d, "_api_success_ts", time.time() - d.STALE_AFTER_SECONDS - 1):
+        stale = d.served_payload(reading)
+        assert (stale["ok"], stale["w"]) == (False, 28)
+    assert reading["ok"] is True          # the stored reading is not mutated
+    assert d.served_payload(None) is None
+
+
+def test_poller_success_stamps_freshness_and_restart_keeps_expiry():
     calls = []
 
     async def scenario():
@@ -139,26 +152,85 @@ def test_failed_polls_expire_a_trusted_reading():
             calls.append(1)
             if len(calls) == 1:
                 return {"acct": "week", "s": 0, "sr": -1, "w": 28, "wr": 100, "ok": True}, False
+            if len(calls) == 2:
+                raise RuntimeError("poller crash")
             return None, False           # live token, transient failure (e.g. 429)
 
         with patch.object(d, "_force_poll", asyncio.Event()), \
              patch.object(d, "_payload_updated", asyncio.Event()), \
+             patch.object(d, "_latest_payload", None), \
+             patch.object(d, "_api_success_ts", 0.0), \
              patch.object(d, "poll_active", poll), \
              patch.object(d, "TICK", 0.01), \
              patch.object(d, "POLL_INTERVAL", 0), \
              patch.object(d, "POLL_RETRY_SECONDS", 0.02), \
-             patch.object(d, "STALE_AFTER_SECONDS", 0.1):
-            task = asyncio.create_task(d._poller_loop(stop))
+             patch.object(d, "STALE_AFTER_SECONDS", 0.2):
+            task = asyncio.create_task(d.poller(stop))
             await asyncio.sleep(0.05)
             with d._latest_lock:
-                fresh = dict(d._latest_payload)
-            await asyncio.sleep(0.3)
+                fresh = d.served_payload(d._latest_payload)
+            await asyncio.sleep(0.4)
             with d._latest_lock:
-                stale = dict(d._latest_payload)
+                stale = d.served_payload(d._latest_payload)
             stop.set()
             await asyncio.wait_for(task, timeout=2)
         return fresh, stale
 
     fresh, stale = _run(scenario())
+    assert len(calls) >= 3               # the crash happened and polling resumed
     assert fresh["ok"] is True and fresh["w"] == 28
     assert stale["ok"] is False and stale["w"] == 28
+
+
+def test_empty_weekly_header_is_a_failed_poll():
+    for bad in ("", "  "):
+        assert _poll({"anthropic-ratelimit-unified-7d-utilization": bad}) is None, repr(bad)
+
+
+def test_pro_account_rejects_bad_weekly_or_session_figures():
+    reset = str(int(time.time()) + 3600)
+    good = {
+        "anthropic-ratelimit-unified-5h-utilization": "0.10",
+        "anthropic-ratelimit-unified-5h-reset": reset,
+        "anthropic-ratelimit-unified-7d-utilization": "0.28",
+        "anthropic-ratelimit-unified-7d-reset": reset,
+    }
+    assert _poll(good)["acct"] == "pro"
+    for name in ("anthropic-ratelimit-unified-5h-utilization",
+                 "anthropic-ratelimit-unified-7d-utilization"):
+        for bad in ("", "x", "-0.1", "nan", "inf", None):
+            h = dict(good)
+            if bad is None:
+                del h[name]
+                if name.endswith("5h-utilization"):
+                    continue             # no 5h header at all = the "week" branch
+            else:
+                h[name] = bad
+            assert _poll(h) is None, (name, bad)
+
+
+def test_infinite_reset_does_not_crash():
+    p = _poll({
+        "anthropic-ratelimit-unified-7d-utilization": "0.28",
+        "anthropic-ratelimit-unified-7d-reset": "inf",
+    })
+    assert (p["acct"], p["w"], p["wr"]) == ("week", 28, 0)
+
+
+def test_active_plan_failure_does_not_switch_to_another_plan():
+    a, b = d.Path("/a"), d.Path("/b")
+    readings = {a: {"acct": "week", "s": 0, "w": 10}, b: {"acct": "week", "s": 0, "w": 99}}
+
+    async def fake_poll(token):
+        r = readings[token]
+        return None if r is None else dict(r)
+
+    sel = d.PlanSelector()
+    with patch.object(d, "read_config_dirs", lambda: [a, b]), \
+         patch.object(d, "read_token_for", lambda p: p), \
+         patch.object(d, "poll_api", fake_poll):
+        first, _ = _run(d.poll_active(sel))
+        assert first["w"] == 99          # b is active
+        readings[b] = None               # b's poll fails; a still answers 10%
+        second, dead = _run(d.poll_active(sel))
+        assert (second, dead) == (None, False)
