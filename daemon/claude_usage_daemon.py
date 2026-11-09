@@ -619,6 +619,20 @@ async def poll_api(token: str) -> dict | None:
             "acct": "pro",
             "ok": True,
         }
+    elif resp.headers.get("anthropic-ratelimit-unified-7d-utilization"):
+        # No 5-hour limit, only the 7-day window (seen on a Max account from
+        # 2026-10-31). Upstream's "week" wire format: s 0 and sr -1 mean "no
+        # session window", so readers that know "week" skip the 5h ceiling and
+        # older firmware still draws the weekly bar.
+        payload = {
+            "s": 0,
+            "sr": -1,
+            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "st": hdr("anthropic-ratelimit-unified-7d-status", "unknown"),
+            "acct": "week",
+            "ok": True,
+        }
     else:
         reset_ts = hdr("anthropic-ratelimit-unified-overage-reset")
         payload = {
