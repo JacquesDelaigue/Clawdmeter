@@ -641,8 +641,9 @@ async def poll_api(token: str) -> dict | None:
     # Pro/Max accounts expose 5h/7d windows; Enterprise/overage use a single
     # spending-limit model reported via overage-utilization. Branches key on a
     # header being present (even empty), so a blank value fails its window's
-    # check rather than falling through to the next branch.
-    if "anthropic-ratelimit-unified-5h-utilization" in resp.headers:
+    # check rather than falling through to the next branch. Any 5h header at
+    # all means a 5h window exists, so its utilization is then required.
+    if any(k.lower().startswith("anthropic-ratelimit-unified-5h-") for k in resp.headers):
         s = window_pct("anthropic-ratelimit-unified-5h-utilization")
         w = window_pct("anthropic-ratelimit-unified-7d-utilization")
         if s is None or w is None:
@@ -706,7 +707,7 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
         period_end = float(reset_ts)
     except ValueError:
         return {"tp": 0, "pd": 30}
-    if period_end <= 0:
+    if not math.isfinite(period_end) or period_end <= 0:
         # reset_ts defaults to "0" when the overage-reset header is absent.
         # fromtimestamp(0) is 1970; stepping a month back lands in 1969, and
         # datetime.timestamp() raises OSError for pre-1970 dates on Windows.
@@ -802,10 +803,11 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
             sessions[d] = int(payload.get(key, 0) or 0)
     if not payloads:
         return None, not any_live
-    if selector.active is not None and selector.active not in payloads:
+    if selector.active in dirs and selector.active not in payloads:
         # The active plan gave no reading this cycle. Switching to another
         # plan's (possibly lower) numbers would hide that, so this cycle is a
         # failed poll; the served reading goes stale after STALE_AFTER_SECONDS.
+        # A plan removed from config_dirs no longer holds the choice.
         log(f"Active plan {selector.active} gave no reading; not switching")
         return None, False
     active = selector.choose(sessions)
@@ -1122,6 +1124,7 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
     """
     global _latest_payload, _api_success_ts
     last_poll = 0.0
+    unpublished_ts = 0.0  # a successful poll's time, until its payload is published
     last_attempt = 0.0
     api_payload: dict | None = None
     last_state_mtime = state_mtime()
@@ -1148,7 +1151,7 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
             if p is not None:
                 api_payload = p
                 last_poll = time.time()
-                _api_success_ts = last_poll
+                unpublished_ts = last_poll
             elif dead:
                 # No live token in any config dir (missing, or a 401/expired
                 # token) -> mark the data not-ok. We keep the last numbers and
@@ -1183,6 +1186,11 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
             payload["port"] = HTTP_PORT
             with _latest_lock:
                 _latest_payload = payload
+                # Stamp freshness only with the payload it belongs to, so a
+                # crash between poll and publish can't re-trust an old reading.
+                if unpublished_ts:
+                    _api_success_ts = unpublished_ts
+                    unpublished_ts = 0.0
             # Level-triggered (full state every push); also push the moment
             # attention itself changes (not just on poll/working-flip) so the
             # beacon reacts within a TICK (~5s) instead of waiting for the

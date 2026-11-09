@@ -201,9 +201,7 @@ def test_pro_account_rejects_bad_weekly_or_session_figures():
         for bad in ("", "x", "-0.1", "nan", "inf", None):
             h = dict(good)
             if bad is None:
-                del h[name]
-                if name.endswith("5h-utilization"):
-                    continue             # no 5h header at all = the "week" branch
+                del h[name]              # other 5h headers remain: still a 5h account
             else:
                 h[name] = bad
             assert _poll(h) is None, (name, bad)
@@ -234,3 +232,79 @@ def test_active_plan_failure_does_not_switch_to_another_plan():
         readings[b] = None               # b's poll fails; a still answers 10%
         second, dead = _run(d.poll_active(sel))
         assert (second, dead) == (None, False)
+
+
+def test_partial_five_hour_headers_are_a_failed_poll():
+    reset = str(int(time.time()) + 3600)
+    p = _poll({
+        "anthropic-ratelimit-unified-5h-status": "rejected",
+        "anthropic-ratelimit-unified-5h-reset": reset,
+        "anthropic-ratelimit-unified-7d-utilization": "0.10",
+        "anthropic-ratelimit-unified-7d-reset": reset,
+    })
+    assert p is None
+
+
+def test_freshness_is_stamped_only_when_the_payload_is_published():
+    """A successful poll whose payload is never published (assembly crashes)
+    must not re-trust the older reading still being served."""
+    old = {"acct": "week", "s": 0, "sr": -1, "w": 10, "wr": 100, "ok": True}
+    calls = []
+
+    async def scenario():
+        stop = asyncio.Event()
+
+        async def poll(selector=None):
+            calls.append(1)
+            return {"acct": "week", "s": 0, "sr": -1, "w": 99, "wr": 100, "ok": True}, False
+
+        def broken_state():
+            raise RuntimeError("malformed hook state")
+
+        stale_ts = time.time() - d.STALE_AFTER_SECONDS - 1
+        with patch.object(d, "_force_poll", asyncio.Event()), \
+             patch.object(d, "_payload_updated", asyncio.Event()), \
+             patch.object(d, "_latest_payload", old), \
+             patch.object(d, "_api_success_ts", stale_ts), \
+             patch.object(d, "poll_active", poll), \
+             patch.object(d, "read_working", broken_state), \
+             patch.object(d, "TICK", 0.01), \
+             patch.object(d, "POLL_INTERVAL", 0), \
+             patch.object(d, "POLL_RETRY_SECONDS", 0.02):
+            task = asyncio.create_task(d.poller(stop))
+            await asyncio.sleep(0.2)
+            with d._latest_lock:
+                served = d.served_payload(d._latest_payload)
+            stop.set()
+            await asyncio.wait_for(task, timeout=2)
+        return served
+
+    served = _run(scenario())
+    assert calls                         # polls succeeded
+    assert (served["w"], served["ok"]) == (10, False)
+
+
+def test_removed_active_plan_releases_the_choice():
+    a, b = d.Path("/a"), d.Path("/b")
+    readings = {a: {"acct": "week", "s": 0, "w": 10}, b: {"acct": "week", "s": 0, "w": 99}}
+    dirs = [a, b]
+
+    async def fake_poll(token):
+        return dict(readings[token])
+
+    sel = d.PlanSelector()
+    with patch.object(d, "read_config_dirs", lambda: list(dirs)), \
+         patch.object(d, "read_token_for", lambda p: p), \
+         patch.object(d, "poll_api", fake_poll):
+        assert _run(d.poll_active(sel))[0]["w"] == 99   # b active
+        dirs.remove(b)                                    # b taken out of config
+        assert _run(d.poll_active(sel))[0]["w"] == 10
+
+
+def test_enterprise_non_finite_reset_does_not_crash():
+    for bad in ("inf", "nan", "-inf"):
+        p = _poll({
+            "anthropic-ratelimit-unified-overage-utilization": "0.40",
+            "anthropic-ratelimit-unified-overage-reset": bad,
+        })
+        assert (p["acct"], p["tp"], p["pd"]) == ("ent", 0, 30), bad
