@@ -90,3 +90,75 @@ def test_no_window_headers_still_give_ent():
     })
     assert p["acct"] == "ent"
     assert p["s"] == 40
+
+
+def test_unreadable_weekly_utilization_is_a_failed_poll():
+    reset = str(int(time.time()) + 3 * 86400)
+    for bad in ("not-a-number", "nan", "inf", "-0.1"):
+        p = _poll({
+            "anthropic-ratelimit-unified-7d-utilization": bad,
+            "anthropic-ratelimit-unified-7d-reset": reset,
+        })
+        assert p is None, bad
+
+
+def test_zero_weekly_utilization_is_a_real_reading():
+    reset = str(int(time.time()) + 3 * 86400)
+    p = _poll({
+        "anthropic-ratelimit-unified-7d-utilization": "0",
+        "anthropic-ratelimit-unified-7d-reset": reset,
+    })
+    assert (p["acct"], p["w"], p["ok"]) == ("week", 0, True)
+
+
+def test_week_accounts_are_chosen_by_weekly_use():
+    a, b = d.Path("/a"), d.Path("/b")
+    readings = {a: {"acct": "week", "s": 0, "w": 10}, b: {"acct": "week", "s": 0, "w": 99}}
+
+    async def fake_poll(token):
+        return dict(readings[token])
+
+    sel = d.PlanSelector()
+    with patch.object(d, "read_config_dirs", lambda: [a, b]), \
+         patch.object(d, "read_token_for", lambda p: p), \
+         patch.object(d, "poll_api", fake_poll):
+        first, _ = _run(d.poll_active(sel))
+        assert first["w"] == 99          # startup: highest weekly % wins
+        readings[a]["w"] = 11            # a's weekly use rises -> a is active
+        second, _ = _run(d.poll_active(sel))
+        assert second["w"] == 11
+
+
+def test_failed_polls_expire_a_trusted_reading():
+    calls = []
+
+    async def scenario():
+        stop = asyncio.Event()
+
+        async def poll(selector=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return {"acct": "week", "s": 0, "sr": -1, "w": 28, "wr": 100, "ok": True}, False
+            return None, False           # live token, transient failure (e.g. 429)
+
+        with patch.object(d, "_force_poll", asyncio.Event()), \
+             patch.object(d, "_payload_updated", asyncio.Event()), \
+             patch.object(d, "poll_active", poll), \
+             patch.object(d, "TICK", 0.01), \
+             patch.object(d, "POLL_INTERVAL", 0), \
+             patch.object(d, "POLL_RETRY_SECONDS", 0.02), \
+             patch.object(d, "STALE_AFTER_SECONDS", 0.1):
+            task = asyncio.create_task(d._poller_loop(stop))
+            await asyncio.sleep(0.05)
+            with d._latest_lock:
+                fresh = dict(d._latest_payload)
+            await asyncio.sleep(0.3)
+            with d._latest_lock:
+                stale = dict(d._latest_payload)
+            stop.set()
+            await asyncio.wait_for(task, timeout=2)
+        return fresh, stale
+
+    fresh, stale = _run(scenario())
+    assert fresh["ok"] is True and fresh["w"] == 28
+    assert stale["ok"] is False and stale["w"] == 28

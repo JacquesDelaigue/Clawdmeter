@@ -12,6 +12,7 @@ import datetime
 import getpass
 import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -39,6 +40,9 @@ TICK = 5
 # After a failed API poll, wait this long before the next try instead of
 # retrying every TICK; also the pause before the poller restarts after a crash.
 POLL_RETRY_SECONDS = 30
+# A reading with no successful poll for this long is served with ok:false, so a
+# run of failed polls (429, network) can't leave old numbers marked trusted.
+STALE_AFTER_SECONDS = 600
 CONNECT_TIMEOUT = 20.0
 # macOS only: name-scan fallback when the OS is not holding the device (kept from
 # Jacques's fork; upstream dropped it. His log shows it reconnecting the device
@@ -624,10 +628,19 @@ async def poll_api(token: str) -> dict | None:
         # 2026-10-31). Upstream's "week" wire format: s 0 and sr -1 mean "no
         # session window", so readers that know "week" skip the 5h ceiling and
         # older firmware still draws the weekly bar.
+        raw = hdr("anthropic-ratelimit-unified-7d-utilization")
+        try:
+            util = float(raw)
+        except ValueError:
+            util = float("nan")
+        if not math.isfinite(util) or util < 0:
+            # pct() would turn this into a trusted 0%; a failed poll instead.
+            log(f"API 7d-utilization unreadable: {raw[:40]!r}")
+            return None
         payload = {
             "s": 0,
             "sr": -1,
-            "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
+            "w": int(round(util * 100)),
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
             "st": hdr("anthropic-ratelimit-unified-7d-status", "unknown"),
             "acct": "week",
@@ -754,7 +767,10 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
         any_live = True
         if payload is not None:
             payloads[d] = payload
-            sessions[d] = int(payload.get("s", 0) or 0)
+            # A "week" account has no session window (s is a placeholder 0), so
+            # its weekly % is what rises with use.
+            key = "w" if payload.get("acct") == "week" else "s"
+            sessions[d] = int(payload.get(key, 0) or 0)
     if not payloads:
         return None, not any_live
     active = selector.choose(sessions)
@@ -1114,6 +1130,11 @@ async def _poller_loop(stop_event: asyncio.Event) -> None:
                 # cycle) -> keep the last payload and retry after
                 # POLL_RETRY_SECONDS.
                 log("No usable config dir this cycle")
+                if (api_payload is not None and api_payload.get("ok")
+                        and time.time() - last_poll > STALE_AFTER_SECONDS):
+                    log(f"No successful poll for {STALE_AFTER_SECONDS}s; "
+                        "marking the last reading not-ok")
+                    api_payload = {**api_payload, "ok": False}
 
         if api_payload is not None:
             mt = state_mtime()
